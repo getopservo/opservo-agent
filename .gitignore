@@ -1,0 +1,27 @@
+# Build output
+bin/
+dist/
+/opservo-agent
+/infrapilot-agent
+/k8s-agent
+
+# Go
+*.test
+*.out
+coverage.*
+
+# Local state and secrets — never commit
+*.db
+*.db-journal
+.env
+.env.*
+*.key
+*.pem
+.agent-signing.key
+.command-signing.key
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

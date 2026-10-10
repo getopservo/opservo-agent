@@ -1,0 +1,8 @@
+# The secret-masking tests use fake credentials on purpose.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "fake credentials in tests; signing comments"
+paths = ['''collectors/redact_test\.go''']
+regexes = ['''Ed25519-verify''']
