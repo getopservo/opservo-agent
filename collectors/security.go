@@ -83,19 +83,19 @@ type SecurityReport struct {
 	RecentLogins        []RecentLogin       `json:"recent_logins"`
 	// SSH hardening (from sshd_config). Pointers: nil when the config can't be
 	// read, so the OHS rules stay dormant rather than assuming a default.
-	SSHPasswordAuth         *bool     `json:"ssh_password_auth,omitempty"`
-	SSHPermitEmptyPasswords *bool     `json:"ssh_permit_empty_passwords,omitempty"`
-	SSHWeakCiphers          *bool     `json:"ssh_weak_ciphers,omitempty"`
+	SSHPasswordAuth         *bool `json:"ssh_password_auth,omitempty"`
+	SSHPermitEmptyPasswords *bool `json:"ssh_permit_empty_passwords,omitempty"`
+	SSHWeakCiphers          *bool `json:"ssh_weak_ciphers,omitempty"`
 	// Extra hardening signals (pointers: nil when undeterminable → OHS rule dormant).
-	Fail2banActive      *bool `json:"fail2ban_active,omitempty"`      // fail2ban/sshguard/crowdsec running
+	Fail2banActive      *bool `json:"fail2ban_active,omitempty"`       // fail2ban/sshguard/crowdsec running
 	AutoSecurityUpdates *bool `json:"auto_security_updates,omitempty"` // unattended-upgrades / dnf-automatic on
 	PasswordlessSudo    *bool `json:"passwordless_sudo,omitempty"`     // a NOPASSWD sudoers entry exists
 	// TCP ports the host firewall drops/rejects for every source on input
 	// (iptables incl. ufw's chains, nftables). Lets the API accept "firewall the
 	// port" as a fix for an exposed dev server. Read-only; see firewallports.go.
-	FirewallBlockedPorts []int `json:"firewall_blocked_ports,omitempty"`
-	Score               int       `json:"score"`
-	CollectedAt         time.Time `json:"collected_at"`
+	FirewallBlockedPorts []int     `json:"firewall_blocked_ports,omitempty"`
+	Score                int       `json:"score"`
+	CollectedAt          time.Time `json:"collected_at"`
 }
 
 // SecurityCollector inspects the host for common, actionable security risks.

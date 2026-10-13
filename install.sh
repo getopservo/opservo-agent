@@ -61,7 +61,7 @@ if [ -z "${DASHBOARD_URL}" ]; then
   DASHBOARD_URL="$(printf '%s' "${API_URL}" | sed -E 's#-api\.#.#; s#//api\.#//#')"
 fi
 VERSION="${OPSERVO_VERSION:-${INFRAPILOT_VERSION:-latest}}"
-REPO="${OPSERVO_REPO:-${INFRAPILOT_REPO:-softuvo-ai/opservo-agent}}"
+REPO="${OPSERVO_REPO:-${INFRAPILOT_REPO:-getopservo/opservo-agent}}"
 TENANT_ID="${OPSERVO_TENANT_ID:-${INFRAPILOT_TENANT_ID:-}}"
 ENROLLMENT_TOKEN="${OPSERVO_TOKEN:-${INFRAPILOT_TOKEN:-}}"   # from the dashboard "Add New Server" flow
 FORCE="${OPSERVO_FORCE:-${INFRAPILOT_FORCE:-0}}"
@@ -585,6 +585,10 @@ write_config() {
   if $SUDO grep -q '^OPSERVO_ENABLE_PROBES=true$' "${CONFIG_FILE}" 2>/dev/null; then
     probes="true"
   fi
+  local shell_opt="false"
+  if $SUDO grep -q '^OPSERVO_ENABLE_SHELL=true$' "${CONFIG_FILE}" 2>/dev/null; then
+    shell_opt="true"
+  fi
   # Recorded identity lets the agent detect AMI/template clones at startup.
   local identity extra
   identity="$(instance_identity)"
@@ -609,6 +613,11 @@ OPSERVO_BUFFER_PATH=${BUFFER_PATH}
 # server (e.g. probe an internal RDS endpoint). Set to true, then:
 #   systemctl restart infrapilot-agent
 OPSERVO_ENABLE_PROBES=${probes}
+# Opt-in: allow live terminal sessions opened from the dashboard (owners and
+# admins, identity check every time, recorded). The server's switch in the
+# dashboard must be on too. Set to true, then:
+#   systemctl restart infrapilot-agent
+OPSERVO_ENABLE_SHELL=${shell_opt}
 ${extra}
 EOF
   success "Wrote ${CONFIG_FILE}"

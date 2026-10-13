@@ -14,8 +14,8 @@ func TestIsClone(t *testing.T) {
 	}{
 		{"i-aaa", "i-bbb", true},
 		{"i-aaa", "i-aaa", false},
-		{"", "i-bbb", false},   // no recorded identity (old installer) — never a clone
-		{"i-aaa", "", false},   // can't read identity now — don't re-register on a flake
+		{"", "i-bbb", false}, // no recorded identity (old installer) — never a clone
+		{"i-aaa", "", false}, // can't read identity now — don't re-register on a flake
 		{"", "", false},
 	}
 	for _, c := range cases {
@@ -39,8 +39,8 @@ OPSERVO_ENROLL_KEY=fleet_abc
 		"OPSERVO_AGENT_ID=new-id",
 		"OPSERVO_SECRET_KEY=new-secret",
 		"OPSERVO_MACHINE_ID=i-new",
-		"OPSERVO_API_URL=https://api.getopservo.com",   // untouched
-		"OPSERVO_ENROLL_KEY=fleet_abc",                 // fleet key survives for the NEXT clone
+		"OPSERVO_API_URL=https://api.getopservo.com", // untouched
+		"OPSERVO_ENROLL_KEY=fleet_abc",               // fleet key survives for the NEXT clone
 		"OPSERVO_BUFFER_PATH=/var/lib/infrapilot/buffer.db",
 	} {
 		if !strings.Contains(out, want) {

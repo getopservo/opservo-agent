@@ -86,3 +86,30 @@ func TestVerifyCommandSignature_InteropWithTypeScriptSigner(t *testing.T) {
 		t.Fatalf("TypeScript-produced signature did not verify in Go: %v", err)
 	}
 }
+
+// The API's signCancel (api/src/lib/commandSigning.test.ts "cancelSigning")
+// produces exactly this signature with the same test seed as the command
+// interop test above. Change both together or never.
+func TestVerifyCancelSignature_InteropWithTypeScriptSigner(t *testing.T) {
+	const pubHex = "1d53ae157ea41fc42412ffa3d865cce96cd1b57441bdde097c91f00dea5b217e"
+	const sig = "cf03dccc6d98e9a4fc04856fe273a7cfd30e14cf41ea372e70f5ed0ad960dc142fb245502648aa68606f4d00bf8ccf8ef858179e507e770756804c4a4c9fa207"
+	const cmdID = "11111111-2222-3333-4444-555555555555"
+	if err := verifyCancelSignature(pubHex, "agent-1", cmdID, sig); err != nil {
+		t.Fatalf("TypeScript-produced cancel signature did not verify in Go: %v", err)
+	}
+	// Bound to one command on one agent.
+	if verifyCancelSignature(pubHex, "agent-2", cmdID, sig) == nil {
+		t.Error("cancel for agent-1 verified for agent-2")
+	}
+	if verifyCancelSignature(pubHex, "agent-1", "99999999-2222-3333-4444-555555555555", sig) == nil {
+		t.Error("cancel for one command verified for another")
+	}
+	if verifyCancelSignature(pubHex, "agent-1", cmdID, "") == nil {
+		t.Error("empty signature accepted")
+	}
+	// A cancel signature is not a valid command signature (domain separation).
+	c := pendingCommand{ID: "cancel", Command: cmdID, ExpiresAt: "agent-1", Signature: sig}
+	if verifyCommandSignature(pubHex, "x", c) == nil {
+		t.Error("cancel signature accepted as a command signature")
+	}
+}

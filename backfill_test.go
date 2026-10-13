@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/softuvo-ai/opservo-agent/buffer"
-	"github.com/softuvo-ai/opservo-agent/sender"
+	"github.com/getopservo/opservo-agent/buffer"
+	"github.com/getopservo/opservo-agent/sender"
 )
 
 // A recovering agent must replay at most maxBackfillPerTick buffered

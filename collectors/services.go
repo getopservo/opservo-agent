@@ -16,7 +16,7 @@ import (
 // PM2 process. Fields that a given source cannot provide are left zero.
 type ServiceInfo struct {
 	Name         string  `json:"name"`
-	Type         string  `json:"type"`   // systemd | docker | pm2
+	Type         string  `json:"type"`   // systemd | docker | pm2 | supervisor
 	Status       string  `json:"status"` // running | failed | restarting | stopped | <raw>
 	Uptime       string  `json:"uptime,omitempty"`
 	CPUPercent   float64 `json:"cpu_percent,omitempty"`
@@ -32,6 +32,10 @@ type ServiceInfo struct {
 	LastExitStatus *int   `json:"last_exit_status,omitempty"` // ExecMainStatus of the last run
 	LastRunAt      string `json:"last_run_at,omitempty"`      // RFC 3339, when the last run ended
 	Rerunning      bool   `json:"rerunning,omitempty"`        // last run failed; the next run is in progress now
+
+	// Supervisor programs only: the raw supervisorctl state (FATAL, BACKOFF,
+	// EXITED, …); Status carries the normalised form.
+	SupervisorState string `json:"supervisor_state,omitempty"`
 }
 
 // ServicesReport is the full output of the service collector. The *_installed
@@ -42,10 +46,14 @@ type ServicesReport struct {
 	SystemdAvailable bool          `json:"systemd_available"`
 	DockerInstalled  bool          `json:"docker_installed"`
 	PM2Installed     bool          `json:"pm2_installed"`
-	CollectedAt      time.Time     `json:"collected_at"`
+	// SupervisorInstalled: supervisorctl is on PATH. SupervisorRunning: whether
+	// supervisord answered (nil = could not tell, e.g. permission denied).
+	SupervisorInstalled bool      `json:"supervisor_installed"`
+	SupervisorRunning   *bool     `json:"supervisor_running,omitempty"`
+	CollectedAt         time.Time `json:"collected_at"`
 }
 
-// ServiceCollector discovers services from systemd, Docker, and PM2. Every
+// ServiceCollector discovers services from systemd, Docker, PM2 and Supervisor. Every
 // source is optional: if a tool is not installed the collector skips it
 // without erroring, so the agent runs anywhere with zero configuration.
 //
@@ -89,6 +97,12 @@ func (s *ServiceCollector) Collect(ctx context.Context) (interface{}, error) {
 	if hasBinary("pm2") {
 		report.PM2Installed = true
 		report.Services = append(report.Services, collectPM2(ctx)...)
+	}
+	if hasBinary("supervisorctl") {
+		report.SupervisorInstalled = true
+		programs, running := collectSupervisor(ctx)
+		report.Services = append(report.Services, programs...)
+		report.SupervisorRunning = running
 	}
 
 	return report, nil

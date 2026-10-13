@@ -56,11 +56,17 @@ func readGitInfo(ctx context.Context, dir string) (*GitInfo, bool) {
 	if ref := strings.TrimSpace(strings.TrimPrefix(h, "ref:")); strings.HasPrefix(h, "ref:") {
 		gi.Branch = strings.TrimPrefix(ref, "refs/heads/")
 		gi.Commit = shortSHA(resolveRef(gitDir, ref))
+		if gi.Commit == "" {
+			gi.Commit = shortSHA(resolveRef(commonGitDir(gitDir), ref))
+		}
 	} else {
 		gi.Branch = "(detached)"
 		gi.Commit = shortSHA(h)
 	}
 	gi.Remote = normalizeRemote(originURL(gitDir))
+	if gi.Remote == "" {
+		gi.Remote = normalizeRemote(originURL(commonGitDir(gitDir)))
+	}
 
 	// Deploy freshness + drift — best-effort via the git binary (may be absent).
 	if ts, ok := gitCLI(ctx, dir, "log", "-1", "--format=%cI"); ok && ts != "" {
@@ -124,6 +130,25 @@ func findGitDir(dir string) (string, bool) {
 		d = filepath.Dir(d)
 	}
 	return "", false
+}
+
+// commonGitDir returns the shared repository directory for a linked worktree
+// (whose per-worktree gitdir holds HEAD but not refs/config — those live in the
+// directory named by its "commondir" file). For a normal .git dir it returns
+// gitDir unchanged.
+func commonGitDir(gitDir string) string {
+	data, err := os.ReadFile(filepath.Join(gitDir, "commondir"))
+	if err != nil {
+		return gitDir
+	}
+	cd := strings.TrimSpace(string(data))
+	if cd == "" {
+		return gitDir
+	}
+	if !filepath.IsAbs(cd) {
+		cd = filepath.Join(gitDir, cd)
+	}
+	return filepath.Clean(cd)
 }
 
 // resolveRef returns the commit sha a symbolic ref points to, checking the loose

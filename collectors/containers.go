@@ -10,7 +10,7 @@ import (
 type ContainerStat struct {
 	Name       string  `json:"name"`
 	CPUPercent float64 `json:"cpu_percent"`
-	MemBytes   int64   `json:"mem_bytes"`    // memory in use
+	MemBytes   int64   `json:"mem_bytes"` // memory in use
 	MemPercent float64 `json:"mem_percent"`
 	NetRxBytes int64   `json:"net_rx_bytes"` // cumulative
 	NetTxBytes int64   `json:"net_tx_bytes"`

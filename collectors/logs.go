@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/softuvo-ai/opservo-agent/buffer"
+	"github.com/getopservo/opservo-agent/buffer"
 )
 
 const (

@@ -15,18 +15,18 @@ import (
 // that needs no credentials (the agent already reads these logs). Aggregated
 // across all detected access logs over the last WindowSeconds.
 type WebInfo struct {
-	Available         bool    `json:"available"`
-	Sources           int     `json:"sources"`            // access-log files counted
-	WindowSeconds     int     `json:"window_seconds"`     // the rolling window
-	Requests          int     `json:"requests"`           // total in the window
-	ReqPerMin         float64 `json:"req_per_min"`        // requests/minute
-	Status2xx         int     `json:"status_2xx"`
-	Status3xx         int     `json:"status_3xx"`
-	Status4xx         int     `json:"status_4xx"`
-	Status5xx         int     `json:"status_5xx"`
-	ErrorRate         float64 `json:"error_rate"`         // (4xx+5xx)/total %
-	ServerErrorRate   float64 `json:"server_error_rate"`  // 5xx/total %
-	BytesSent         int64   `json:"bytes_sent"`
+	Available       bool    `json:"available"`
+	Sources         int     `json:"sources"`        // access-log files counted
+	WindowSeconds   int     `json:"window_seconds"` // the rolling window
+	Requests        int     `json:"requests"`       // total in the window
+	ReqPerMin       float64 `json:"req_per_min"`    // requests/minute
+	Status2xx       int     `json:"status_2xx"`
+	Status3xx       int     `json:"status_3xx"`
+	Status4xx       int     `json:"status_4xx"`
+	Status5xx       int     `json:"status_5xx"`
+	ErrorRate       float64 `json:"error_rate"`        // (4xx+5xx)/total %
+	ServerErrorRate float64 `json:"server_error_rate"` // 5xx/total %
+	BytesSent       int64   `json:"bytes_sent"`
 }
 
 type WebStats struct {

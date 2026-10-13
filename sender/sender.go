@@ -16,7 +16,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/softuvo-ai/opservo-agent/collectors"
+	"github.com/getopservo/opservo-agent/collectors"
 )
 
 // robustTransport reconnects cleanly after an API blip (e.g. a deploy recreating

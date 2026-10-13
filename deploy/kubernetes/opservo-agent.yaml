@@ -143,7 +143,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: agent
-          image: ghcr.io/softuvo-ai/opservo-k8s-agent:latest
+          image: ghcr.io/getopservo/opservo-k8s-agent:latest
           imagePullPolicy: Always
           args: ["--interval=60s"]
           envFrom:

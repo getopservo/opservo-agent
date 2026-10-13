@@ -30,9 +30,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/softuvo-ai/opservo-agent/collectors"
-	"github.com/softuvo-ai/opservo-agent/k8s"
-	"github.com/softuvo-ai/opservo-agent/sender"
+	"github.com/getopservo/opservo-agent/collectors"
+	"github.com/getopservo/opservo-agent/k8s"
+	"github.com/getopservo/opservo-agent/sender"
 )
 
 // version is injected at build time via -ldflags "-X main.version=...".

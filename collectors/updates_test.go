@@ -4,10 +4,10 @@ import "testing"
 
 func TestParseAptUpgradable(t *testing.T) {
 	cases := []struct {
-		name           string
-		out            string
-		wantPending    int
-		wantSecurity   int
+		name         string
+		out          string
+		wantPending  int
+		wantSecurity int
 	}{
 		{
 			name: "mixed updates + security suites",

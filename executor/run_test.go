@@ -58,10 +58,11 @@ func TestCapWriter_Truncates(t *testing.T) {
 func TestRunCommandWithProgress_StreamsPartialOutput(t *testing.T) {
 	var mu sync.Mutex
 	var snapshots []string
-	res := runCommandWithProgress(context.Background(), "echo one; sleep 0.35; echo two; sleep 0.35; echo three", nil, 5*time.Second, 100*time.Millisecond, func(stdout, _ string) {
+	res := runCommandWithProgress(context.Background(), "echo one; sleep 0.35; echo two; sleep 0.35; echo three", nil, 5*time.Second, 100*time.Millisecond, func(stdout, _ string) bool {
 		mu.Lock()
 		snapshots = append(snapshots, stdout)
 		mu.Unlock()
+		return false
 	})
 	if res.Status != "done" || res.ExitCode != 0 {
 		t.Fatalf("expected done/0, got %+v", res)
@@ -92,7 +93,7 @@ func TestRunCommandWithProgress_StreamsPartialOutput(t *testing.T) {
 
 func TestRunCommandWithProgress_NoCallbackForSilentCommand(t *testing.T) {
 	calls := 0
-	res := runCommandWithProgress(context.Background(), "sleep 0.3", nil, 5*time.Second, 50*time.Millisecond, func(_, _ string) { calls++ })
+	res := runCommandWithProgress(context.Background(), "sleep 0.3", nil, 5*time.Second, 50*time.Millisecond, func(_, _ string) bool { calls++; return false })
 	if res.Status != "done" {
 		t.Fatalf("got %+v", res)
 	}
@@ -117,5 +118,40 @@ func TestNextInterval(t *testing.T) {
 		if got := nextInterval(base, c.hint); got != c.want {
 			t.Errorf("nextInterval(%v, %v) = %v, want %v", base, c.hint, got, c.want)
 		}
+	}
+}
+
+func TestRunCommandWithProgress_StopKillsTheProcessGroup(t *testing.T) {
+	start := time.Now()
+	// `sleep 30` in a child keeps the pipe open; only a process-group kill ends it fast.
+	res := runCommandWithProgress(context.Background(), "echo started; sleep 30", nil, 60*time.Second, 50*time.Millisecond, func(stdout, _ string) bool {
+		return strings.Contains(stdout, "started")
+	})
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("stop took %v — process group was not killed", took)
+	}
+	if res.Status != "error" || res.ExitCode != -1 || !strings.Contains(res.Stderr, stoppedNote) {
+		t.Fatalf("got %+v", res)
+	}
+	if strings.Contains(res.Stderr, "timeout") {
+		t.Errorf("a stop must not be reported as a timeout: %q", res.Stderr)
+	}
+}
+
+func TestRunCommandWithProgress_KeepaliveReachesASilentCommand(t *testing.T) {
+	old := progressKeepalive
+	progressKeepalive = 150 * time.Millisecond
+	defer func() { progressKeepalive = old }()
+	calls := 0
+	start := time.Now()
+	res := runCommandWithProgress(context.Background(), "sleep 30", nil, 60*time.Second, 50*time.Millisecond, func(_, _ string) bool {
+		calls++
+		return true // "Stop now" arrives on the first keepalive
+	})
+	if calls == 0 || time.Since(start) > 5*time.Second {
+		t.Fatalf("silent command was not stoppable: calls=%d took=%v", calls, time.Since(start))
+	}
+	if !strings.Contains(res.Stderr, stoppedNote) {
+		t.Fatalf("got %+v", res)
 	}
 }

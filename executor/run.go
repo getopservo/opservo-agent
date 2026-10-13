@@ -12,6 +12,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -151,9 +152,24 @@ type CommandResult struct {
 }
 
 // ProgressFunc receives the output captured so far. Called from a separate
-// goroutine at most once per interval while the command runs, and only when
-// something changed since the last call.
-type ProgressFunc func(stdout, stderr string)
+// goroutine at most once per interval while the command runs: when something
+// changed since the last call, and at least every progressKeepalive even when
+// nothing did (a silent `sleep` or a quiet build must still be stoppable).
+// Returning true stops the command: its whole process group is killed, the
+// same way a timeout kills it. The caller only returns true after verifying a
+// signed cancel from the API (see executor.go).
+type ProgressFunc func(stdout, stderr string) (stop bool)
+
+// progressKeepalive is how often progress is sent for a command whose output
+// hasn't changed, so the API's "Stop now" reaches it. A var for tests.
+var progressKeepalive = 5 * time.Second
+
+// errStopped is the context cause when a command is stopped from the dashboard.
+var errStopped = errors.New("stopped from the dashboard")
+
+// stoppedNote is appended to stderr when a command is stopped from the
+// dashboard, so its history shows why it ended.
+const stoppedNote = "[opservo] command stopped from the dashboard"
 
 // runCommand executes a shell command with a timeout, capturing capped
 // stdout/stderr and the exit code. It never returns an error: launch/timeout
@@ -170,7 +186,9 @@ func runCommandWithProgress(ctx context.Context, command string, env map[string]
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
-	cctx, cancel := context.WithTimeout(ctx, timeout)
+	sctx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
+	cctx, cancel := context.WithTimeout(sctx, timeout)
 	defer cancel()
 
 	var stdout, stderr capWriter
@@ -209,15 +227,20 @@ func runCommandWithProgress(ctx context.Context, command string, env map[string]
 				t := time.NewTicker(every)
 				defer t.Stop()
 				var lastOut, lastErr string
+				lastSent := time.Now()
 				for {
 					select {
 					case <-done:
 						return
 					case <-t.C:
 						out, errOut := stdout.String(), stderr.String()
-						if out != lastOut || errOut != lastErr {
+						if out != lastOut || errOut != lastErr || time.Since(lastSent) >= progressKeepalive {
 							lastOut, lastErr = out, errOut
-							onProgress(out, errOut)
+							lastSent = time.Now()
+							if onProgress(out, errOut) {
+								stop(errStopped)
+								return
+							}
 						}
 					}
 				}
@@ -235,6 +258,16 @@ func runCommandWithProgress(ctx context.Context, command string, env map[string]
 		Status: "done",
 	}
 
+	if errors.Is(context.Cause(sctx), errStopped) {
+		res.Status = "error"
+		res.ExitCode = -1
+		if res.Stderr == "" {
+			res.Stderr = stoppedNote
+		} else {
+			res.Stderr += "\n" + stoppedNote
+		}
+		return res
+	}
 	if cctx.Err() == context.DeadlineExceeded {
 		res.Status = "error"
 		res.ExitCode = -1

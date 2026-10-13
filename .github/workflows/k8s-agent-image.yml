@@ -1,6 +1,6 @@
 name: Kubernetes agent image
 
-# Publishes ghcr.io/softuvo-ai/opservo-k8s-agent. `main` publishes :latest
+# Publishes ghcr.io/getopservo/opservo-k8s-agent. `main` publishes :latest
 # (+ :sha-…), tags v* publish :vX. The package must be PUBLIC (Packages →
 # opservo-k8s-agent → Package settings → Change visibility) so clusters can
 # pull it without a pull secret.
@@ -29,7 +29,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/softuvo-ai/opservo-k8s-agent
+          images: ghcr.io/getopservo/opservo-k8s-agent
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=ref,event=tag

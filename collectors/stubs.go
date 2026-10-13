@@ -280,11 +280,11 @@ type NetworkInfo struct {
 	BytesSent uint64 `json:"bytes_sent"`
 	BytesRecv uint64 `json:"bytes_recv"`
 	// Network-health facts for OHS (nil when the probe couldn't run → dormant).
-	NICDown          *bool     `json:"nic_down,omitempty"`
-	GatewayReachable *bool     `json:"gateway_reachable,omitempty"`
-	PacketLossPct    *float64  `json:"packet_loss_percent,omitempty"`
-	DNSResolves      *bool     `json:"dns_resolves,omitempty"`
-	InterfaceErrors  *int      `json:"interface_errors,omitempty"` // rx+tx errs+drops on the primary NIC since the last heartbeat
+	NICDown          *bool    `json:"nic_down,omitempty"`
+	GatewayReachable *bool    `json:"gateway_reachable,omitempty"`
+	PacketLossPct    *float64 `json:"packet_loss_percent,omitempty"`
+	DNSResolves      *bool    `json:"dns_resolves,omitempty"`
+	InterfaceErrors  *int     `json:"interface_errors,omitempty"` // rx+tx errs+drops on the primary NIC since the last heartbeat
 	// TCPRetransmitPct: retransmitted TCP segments as a % of segments sent over
 	// the interval — a link-quality / congestion signal ahead of visible loss.
 	TCPRetransmitPct *float64 `json:"tcp_retransmit_percent,omitempty"`

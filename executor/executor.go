@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/getopservo/opservo-agent/shell"
 )
 
 // commandSigningPublicKeyHex is the Ed25519 public key (64 hex chars) used to
@@ -38,7 +40,17 @@ type Executor struct {
 	secretKey string
 	interval  time.Duration
 	client    *http.Client
+	// shell opens live terminal sessions delivered in the poll response; nil
+	// when OPSERVO_ENABLE_SHELL is off, and then any delivered start is ignored.
+	shell *shell.Manager
 }
+
+// WithShell turns on live terminal sessions for this executor.
+func (e *Executor) WithShell(m *shell.Manager) *Executor { e.shell = m; return e }
+
+// CommandSigningPublicKeyHex is the embedded command-signing public key, which
+// also verifies live terminal session starts.
+func CommandSigningPublicKeyHex() string { return commandSigningPublicKeyHex }
 
 func New(apiURL, agentID, secretKey string, interval time.Duration) *Executor {
 	if interval <= 0 {
@@ -82,6 +94,31 @@ func verifyCommandSignature(pubKeyHex, agentID string, c pendingCommand) error {
 		return fmt.Errorf("missing or malformed signature")
 	}
 	msg := c.ID + "\n" + agentID + "\n" + c.Command + "\n" + c.ExpiresAt
+	if !ed25519.Verify(ed25519.PublicKey(pub), []byte(msg), sig) {
+		return fmt.Errorf("signature verification failed")
+	}
+	return nil
+}
+
+// verifyCancelSignature checks a "stop this command" instruction from the API.
+// The message is domain-tagged ("cancel" first line, which a command message —
+// it starts with a UUID — or a probe message never is) and names one command
+// on one agent, so a captured cancel can only ever stop that same command.
+// Must match the API's cancelSigningMessage byte-for-byte. Same fail-closed
+// and empty-key conventions as verifyCommandSignature.
+func verifyCancelSignature(pubKeyHex, agentID, commandID, sigHex string) error {
+	if pubKeyHex == "" {
+		return nil
+	}
+	pub, err := hex.DecodeString(strings.TrimSpace(pubKeyHex))
+	if err != nil || len(pub) != ed25519.PublicKeySize {
+		return fmt.Errorf("bad embedded command-signing public key")
+	}
+	sig, err := hex.DecodeString(strings.TrimSpace(sigHex))
+	if err != nil || len(sig) != ed25519.SignatureSize {
+		return fmt.Errorf("missing or malformed signature")
+	}
+	msg := "cancel\n" + commandID + "\n" + agentID
 	if !ed25519.Verify(ed25519.PublicKey(pub), []byte(msg), sig) {
 		return fmt.Errorf("signature verification failed")
 	}
@@ -133,10 +170,17 @@ func nextInterval(base, hint time.Duration) time.Duration {
 }
 
 func (e *Executor) poll(ctx context.Context) (hint time.Duration) {
-	cmds, hint, err := e.fetchPending(ctx)
+	cmds, shells, hint, err := e.fetchPending(ctx)
 	if err != nil {
 		slog.Debug("command poll failed", "error", err)
 		return 0
+	}
+	for _, s := range shells {
+		if e.shell == nil {
+			slog.Warn("live terminal session requested but OPSERVO_ENABLE_SHELL is off on this server — ignored", "session_id", s.ID)
+			continue
+		}
+		e.shell.Open(ctx, s)
 	}
 	for _, c := range cmds {
 		if err := verifyCommandSignature(commandSigningPublicKeyHex, e.agentID, c); err != nil {
@@ -147,12 +191,31 @@ func (e *Executor) poll(ctx context.Context) (hint time.Duration) {
 			}
 			continue
 		}
+		if touchesAgentSwitches(c.Command) {
+			slog.Error("REFUSING command that touches the agent's own switches — not executing", "command_id", c.ID)
+			res := CommandResult{Status: "error", ExitCode: -1, Stderr: selfProtectMessage}
+			if serr := e.submitResult(ctx, c.ID, res); serr != nil {
+				slog.Warn("failed to submit command result", "command_id", c.ID, "error", serr)
+			}
+			continue
+		}
 		slog.Warn("executing dispatched command", "command_id", c.ID, "command", c.Command, "has_secrets", len(c.Env) > 0)
 		id := c.ID
-		res := runCommandWithProgress(ctx, c.Command, c.Env, time.Duration(c.TimeoutSeconds)*time.Second, progressEvery, func(stdout, stderr string) {
-			if perr := e.submitProgress(ctx, id, stdout, stderr); perr != nil {
+		res := runCommandWithProgress(ctx, c.Command, c.Env, time.Duration(c.TimeoutSeconds)*time.Second, progressEvery, func(stdout, stderr string) bool {
+			cancelSig, perr := e.submitProgress(ctx, id, stdout, stderr)
+			if perr != nil {
 				slog.Debug("failed to submit command progress", "command_id", id, "error", perr)
+				return false
 			}
+			if cancelSig == nil {
+				return false
+			}
+			if err := verifyCancelSignature(commandSigningPublicKeyHex, e.agentID, id, *cancelSig); err != nil {
+				slog.Error("IGNORING stop request with a bad signature — command keeps running", "command_id", id, "error", err)
+				return false
+			}
+			slog.Warn("stopping command: stop requested from the dashboard", "command_id", id)
+			return true
 		})
 		slog.Warn("command finished", "command_id", c.ID, "status", res.Status, "exit_code", res.ExitCode)
 		if err := e.submitResult(ctx, c.ID, res); err != nil {
@@ -166,40 +229,52 @@ func (e *Executor) poll(ctx context.Context) (hint time.Duration) {
 // with the agent secret (same scheme as heartbeats) so the API can authenticate
 // the agent, and marks the returned commands as dispatched server-side.
 // It also returns the API's poll-cadence hint (0 when absent).
-func (e *Executor) fetchPending(ctx context.Context) ([]pendingCommand, time.Duration, error) {
+func (e *Executor) fetchPending(ctx context.Context) ([]pendingCommand, []shell.Start, time.Duration, error) {
 	body, _ := json.Marshal(map[string]string{"timestamp": time.Now().UTC().Format(time.RFC3339)})
 	resp, err := e.signedPost(ctx, "/api/v1/agents/"+e.agentID+"/commands/poll", body)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, 0, fmt.Errorf("poll status %d", resp.StatusCode)
+		return nil, nil, 0, fmt.Errorf("poll status %d", resp.StatusCode)
 	}
 	var out struct {
 		Commands       []pendingCommand `json:"commands"`
+		ShellSessions  []shell.Start    `json:"shell_sessions"`
 		PollIntervalMs int              `json:"poll_interval_ms"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
-	return out.Commands, time.Duration(out.PollIntervalMs) * time.Millisecond, nil
+	return out.Commands, out.ShellSessions, time.Duration(out.PollIntervalMs) * time.Millisecond, nil
 }
 
 // submitProgress pushes the output captured so far for a still-running
 // command. Best-effort: an old API (404) or a blip just means the dashboard
-// sees the output when the command finishes, as before.
-func (e *Executor) submitProgress(ctx context.Context, commandID, stdout, stderr string) error {
+// sees the output when the command finishes, as before. When someone pressed
+// "Stop now", the response carries a cancel signature (returned unverified —
+// the caller verifies it); nil means keep running.
+func (e *Executor) submitProgress(ctx context.Context, commandID, stdout, stderr string) (*string, error) {
 	body, _ := json.Marshal(map[string]string{"stdout": stdout, "stderr": stderr})
 	resp, err := e.signedPost(ctx, "/api/v1/agents/"+e.agentID+"/commands/"+commandID+"/progress", body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		return fmt.Errorf("progress status %d", resp.StatusCode)
+		return nil, fmt.Errorf("progress status %d", resp.StatusCode)
 	}
-	return nil
+	var out struct {
+		Cancel *struct {
+			Signature string `json:"signature"`
+		} `json:"cancel"`
+	}
+	// An old API answers {received:true}; a body we can't parse is "no cancel".
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || out.Cancel == nil {
+		return nil, nil
+	}
+	return &out.Cancel.Signature, nil
 }
 
 func (e *Executor) submitResult(ctx context.Context, commandID string, res CommandResult) error {

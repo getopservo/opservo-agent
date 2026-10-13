@@ -16,7 +16,7 @@ import (
 // DomainInfo describes a virtual host and the state of its TLS certificate.
 type DomainInfo struct {
 	Domain          string     `json:"domain"`
-	Server          string     `json:"server"` // nginx | apache
+	Server          string     `json:"server"`         // nginx | apache
 	Root            string     `json:"root,omitempty"` // vhost document root → correlate to an app
 	SSLExpiry       *time.Time `json:"ssl_expiry,omitempty"`
 	DaysUntilExpiry *int       `json:"days_until_expiry,omitempty"`

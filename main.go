@@ -13,39 +13,47 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/softuvo-ai/opservo-agent/buffer"
-	"github.com/softuvo-ai/opservo-agent/collectors"
-	"github.com/softuvo-ai/opservo-agent/executor"
-	"github.com/softuvo-ai/opservo-agent/prober"
-	"github.com/softuvo-ai/opservo-agent/sender"
-	"github.com/softuvo-ai/opservo-agent/updater"
+	"github.com/getopservo/opservo-agent/buffer"
+	"github.com/getopservo/opservo-agent/collectors"
+	"github.com/getopservo/opservo-agent/executor"
+	"github.com/getopservo/opservo-agent/prober"
+	"github.com/getopservo/opservo-agent/sender"
+	"github.com/getopservo/opservo-agent/shell"
+	"github.com/getopservo/opservo-agent/updater"
 )
 
 // version is injected at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
 var (
-	apiURL     = flag.String("api-url", getEnv("OPSERVO_API_URL", "INFRAPILOT_API_URL", "https://api.getopservo.com"), "Opservo API URL")
-	agentID    = flag.String("agent-id", getEnv("OPSERVO_AGENT_ID", "INFRAPILOT_AGENT_ID", ""), "Agent ID (assigned at registration)")
-	secretKey  = flag.String("secret-key", getEnv("OPSERVO_SECRET_KEY", "INFRAPILOT_SECRET_KEY", ""), "Agent secret key")
-	devMode    = flag.Bool("dev", false, "Development mode (verbose logging, skip TLS verify)")
-	interval   = flag.Duration("interval", 60*time.Second, "Heartbeat interval")
+	apiURL         = flag.String("api-url", getEnv("OPSERVO_API_URL", "INFRAPILOT_API_URL", "https://api.getopservo.com"), "Opservo API URL")
+	agentID        = flag.String("agent-id", getEnv("OPSERVO_AGENT_ID", "INFRAPILOT_AGENT_ID", ""), "Agent ID (assigned at registration)")
+	secretKey      = flag.String("secret-key", getEnv("OPSERVO_SECRET_KEY", "INFRAPILOT_SECRET_KEY", ""), "Agent secret key")
+	devMode        = flag.Bool("dev", false, "Development mode (verbose logging, skip TLS verify)")
+	interval       = flag.Duration("interval", 60*time.Second, "Heartbeat interval")
 	autoUpdate     = flag.Bool("auto-update", getEnv("OPSERVO_AUTO_UPDATE", "INFRAPILOT_AUTO_UPDATE", "true") != "false", "Self-update the agent binary from the API")
 	updateInterval = flag.Duration("update-interval", time.Hour, "How often to check for agent updates")
-	bufferPath = flag.String("buffer-path", getEnv("OPSERVO_BUFFER_PATH", "INFRAPILOT_BUFFER_PATH", defaultBufferPath()), "Path to the local SQLite buffer")
+	bufferPath     = flag.String("buffer-path", getEnv("OPSERVO_BUFFER_PATH", "INFRAPILOT_BUFFER_PATH", defaultBufferPath()), "Path to the local SQLite buffer")
 	// SECURITY: remote command execution is CLOUD-CONTROLLED. The agent polls by
 	// default (so a fleet update makes every server ready with no per-box work),
 	// but a server only ever RUNS a command when its `actions_enabled` flag is
 	// turned on in the dashboard — the API refuses to dispatch otherwise. Set
 	// OPSERVO_ENABLE_ACTIONS=false as a hard, local kill-switch on a box that
 	// must never accept commands regardless of the dashboard.
-	enableActions = flag.Bool("enable-actions", getEnv("OPSERVO_ENABLE_ACTIONS", "INFRAPILOT_ENABLE_ACTIONS", "true") != "false", "Poll for dashboard-dispatched commands (execution still gated server-side; set false to hard-disable on this host)")
+	enableActions  = flag.Bool("enable-actions", getEnv("OPSERVO_ENABLE_ACTIONS", "INFRAPILOT_ENABLE_ACTIONS", "true") != "false", "Poll for dashboard-dispatched commands (execution still gated server-side; set false to hard-disable on this host)")
 	actionInterval = flag.Duration("action-interval", 5*time.Second, "How often to poll for dispatched commands")
 	// SECURITY: agent-based uptime probes (TCP checks against private-network
 	// targets, run from this box) are OFF unless the operator opts this server
 	// in locally. A fleet-wide agent update never makes a server probe anything.
 	// Assignments must also carry a valid API signature (see prober package).
 	enableProbes = flag.Bool("enable-probes", getEnv("OPSERVO_ENABLE_PROBES", "INFRAPILOT_ENABLE_PROBES", "false") == "true", "Run dashboard-assigned private-network TCP uptime checks from this server (opt-in)")
+	// SECURITY: live terminal sessions (B-6) are OFF unless the operator sets
+	// OPSERVO_ENABLE_SHELL=true on this server — unlike remote actions, the
+	// local switch defaults OFF, so a fleet update never gives any server an
+	// interactive shell. The dashboard's per-server switch must ALSO be on,
+	// remote actions must not be hard-disabled here, and every session start
+	// must carry a valid API signature (see the shell package).
+	enableShell = flag.Bool("enable-shell", getEnv("OPSERVO_ENABLE_SHELL", "INFRAPILOT_ENABLE_SHELL", "false") == "true", "Allow live terminal sessions opened from the dashboard (opt-in; needs remote actions too)")
 )
 
 // defaultBufferPath returns a per-user location for the agent's SQLite buffer.
@@ -117,10 +125,19 @@ func main() {
 		*agentID = id
 		*secretKey = key
 		slog.Info("Registration successful", "agent_id", id)
-		slog.Info("Add these to your environment to skip registration on restart",
-			"OPSERVO_AGENT_ID", id,
-			"OPSERVO_SECRET_KEY", key,
-		)
+		// The secret key is only echoed in --dev mode: in production logs end up in
+		// journald and log shippers. (The installer persists both values to
+		// /etc/infrapilot/config itself, so a normal install never relies on this.)
+		if *devMode {
+			slog.Info("Add these to your environment to skip registration on restart",
+				"OPSERVO_AGENT_ID", id,
+				"OPSERVO_SECRET_KEY", key,
+			)
+		} else {
+			slog.Info("Persist OPSERVO_AGENT_ID and OPSERVO_SECRET_KEY in "+configPath+" to skip registration on restart — the secret is not logged outside --dev; install with install.sh to have it persisted for you",
+				"OPSERVO_AGENT_ID", id,
+			)
+		}
 	}
 
 	// Open the local SQLite buffer (used for per-file log cursors and content
@@ -157,7 +174,7 @@ func main() {
 		collectors.NewScheduledCollector(),
 		collectors.NewUsersCollector(),
 		collectors.NewPackagesCollector(),
-		collectors.NewActionsCollector(*enableActions),
+		collectors.NewActionsCollector(*enableActions, *enableActions && *enableShell, shell.LoginUsers),
 		collectors.NewProbesCollector(*enableProbes),
 		collectors.NewAgentInfoCollector(version),
 		collectors.NewWebMetricsCollector(),
@@ -184,7 +201,15 @@ func main() {
 	// Remote command polling — on unless hard-disabled locally; the API only
 	// dispatches to servers with actions switched on in the dashboard.
 	if *enableActions {
-		go executor.New(*apiURL, *agentID, *secretKey, *actionInterval).Run(ctx)
+		ex := executor.New(*apiURL, *agentID, *secretKey, *actionInterval)
+		if *enableShell {
+			slog.Warn("LIVE TERMINAL ENABLED — owners/admins can open a shell on this server from the dashboard when its terminal switch is on",
+				"agent_id", *agentID)
+			ex = ex.WithShell(shell.NewManager(*apiURL, *agentID, *secretKey, executor.CommandSigningPublicKeyHex(), *devMode))
+		}
+		go ex.Run(ctx)
+	} else if *enableShell {
+		slog.Warn("OPSERVO_ENABLE_SHELL is set but remote actions are hard-disabled here (OPSERVO_ENABLE_ACTIONS=false) — live terminal stays off")
 	}
 
 	// Agent-based uptime probes — only when explicitly opted in on this server.
