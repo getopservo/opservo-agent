@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestNormalizeRemote(t *testing.T) {
@@ -88,6 +89,64 @@ func TestReadGitInfo_StatusFailureIsUnknownNotClean(t *testing.T) {
 	gi, ok = readGitInfo(ctx, dir)
 	if !ok || !gi.DirtyUnknown || gi.Dirty == nil || !*gi.Dirty {
 		t.Fatalf("failed read: %+v, want dirty_unknown with the last known dirty=true", gi)
+	}
+}
+
+// The agent must never write to a repo it reads. A plain `git status` refreshes
+// stale stat info by rewriting .git/index under .git/index.lock; a killed git
+// leaves that lock behind and blocks the owner's next pull (prod, 8 + 14 Oct
+// 2026). The agent's git calls must leave the index untouched.
+func TestGitCLI_DoesNotWriteTheIndex(t *testing.T) {
+	if !hasBinary("git") {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.email=t@t", "-c", "user.name=t"}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Skipf("git %v: %v %s", args, err, out)
+		}
+	}
+	file := filepath.Join(dir, "a.txt")
+	index := filepath.Join(dir, ".git", "index")
+	// staleIndex moves a.txt's mtime so the index's stat info is out of date
+	// and the next `git status` wants to refresh it; returns the index bytes.
+	stamp := time.Now().Add(-time.Hour)
+	staleIndex := func() []byte {
+		stamp = stamp.Add(time.Minute)
+		if err := os.Chtimes(file, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(index)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	run("init", "-q")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "a.txt")
+	run("commit", "-q", "-m", "init")
+
+	// Control: a plain git status does rewrite the index here; if this git
+	// doesn't, the check below proves nothing.
+	before := staleIndex()
+	run("status", "--porcelain")
+	if after, _ := os.ReadFile(index); string(after) == string(before) {
+		t.Skip("this git does not refresh the index on status")
+	}
+
+	before = staleIndex()
+	if _, ok := gitCLITimeout(context.Background(), gitStatusTimeout, dir, "status", "--porcelain"); !ok {
+		t.Fatal("git status failed")
+	}
+	if after, _ := os.ReadFile(index); string(after) != string(before) {
+		t.Fatal("the agent's git status rewrote .git/index; it must run with GIT_OPTIONAL_LOCKS=0")
+	}
+	if _, err := os.Stat(index + ".lock"); err == nil {
+		t.Fatal("index.lock left behind")
 	}
 }
 

@@ -94,11 +94,19 @@ func gitCLI(ctx context.Context, workdir string, args ...string) (string, bool) 
 }
 
 // gitCLITimeout is gitCLI with an explicit timeout.
+//
+// GIT_OPTIONAL_LOCKS=0: `git status` otherwise takes .git/index.lock to refresh
+// the index, and when the timeout kills it that lock is left behind (owned by
+// root, since the agent runs as root), so the owner's next `git pull` or deploy
+// fails. Set as an env var, not --no-optional-locks: git older than 2.15 (e.g.
+// CentOS 7) rejects the flag but ignores the variable.
 func gitCLITimeout(ctx context.Context, timeout time.Duration, workdir string, args ...string) (string, bool) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	full := append([]string{"-C", workdir, "-c", "safe.directory=*"}, args...)
-	out, err := exec.CommandContext(ctx, "git", full...).Output()
+	cmd := exec.CommandContext(ctx, "git", full...)
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	out, err := cmd.Output()
 	if err != nil {
 		return "", false
 	}
