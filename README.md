@@ -28,7 +28,7 @@ containing:
 | Logs | New log lines from nginx, Apache, Laravel, Docker, PM2 and journald warnings (at most 200 per source per heartbeat, deduplicated between heartbeats) |
 | Security | Exposed database ports, failed SSH logins, root login and SSH hardening settings, firewall state, suspicious processes, recent logins. Usernames and source IPs are masked on the host before sending (e.g. `alice` → `al***`, `1.2.3.4` → `1.2.*.*`). |
 | Storage / reliability | Inode use, read-only remounts, SMART health, kernel I/O errors per disk, OOM kills, reboots |
-| Maintenance | Pending package updates, reboot-required, runtimes, cron jobs and timers, local users, installed packages |
+| Maintenance | Pending package updates, reboot-required, runtimes, cron jobs and timers, local users, installed packages. Crontab lines, process command lines, login records and container crash logs go through the same secret redaction before they leave the host (tokens, passwords, keys and e-mail addresses are replaced). |
 | Data stores | Redis, MySQL and PostgreSQL health facts. Query text is stripped of string and number literals before it leaves the host. |
 | Web | Request and error rates from web server access logs |
 
@@ -78,13 +78,39 @@ service". How this is controlled:
   signature (public key embedded in `executor/executor.go`) and refuses
   unsigned or altered commands. The expiry time is part of the signed
   message; the API stops handing out a command once it has expired.
-- Commands run with `sh -c` as the agent's user, in their own process group,
-  with a timeout and 64 KB output cap. The command and its output are recorded
-  in the workspace's audit log.
+- Commands run with `sh -c` **as root** (the systemd unit written by
+  `install.sh` runs the agent as root, which the collectors need), in their own
+  process group, with a timeout and 64 KB output cap. The command and its
+  output are recorded in the workspace's audit log. The agent also checks the
+  command's expiry locally and refuses anything that is already past it.
+- The agent refuses commands that would edit its own config, its systemd unit
+  or any `OPSERVO_ENABLE_*` switch, so the local switches below cannot be
+  flipped over the command channel. This is a text guard, not a sandbox.
 - **To turn command polling off completely on a host**, set
   `OPSERVO_ENABLE_ACTIONS=false` in `/etc/infrapilot/config` (or pass
   `--enable-actions=false`) and restart the agent. The agent then never asks
   for commands, whatever the dashboard says.
+
+## Live terminal (opt-in)
+
+The dashboard can open an interactive shell (a real PTY, for `top`, `vim`,
+prompts) on a server. This is **off by default on the host** and needs two
+switches: the server's live terminal must be turned on in the dashboard by an
+owner or admin, **and** `OPSERVO_ENABLE_SHELL=true` must be set in
+`/etc/infrapilot/config` (or `--enable-shell`). `OPSERVO_ENABLE_ACTIONS=false`
+also disables it. How it works:
+
+- Each session start is Ed25519-signed by the API (session id, agent, user,
+  expiry) and delivered in the command-poll response; the agent refuses an
+  unsigned start. The agent then dials **out** over a WebSocket to the API;
+  nothing connects in.
+- Sessions run as a login user on the box (root or a uid ≥ 1000 with a real
+  shell), chosen per session in the dashboard. At most 3 per server, 15 min
+  idle, 4 h maximum; closing the browser tab ends the shell.
+- Screen output (2 MB cap) and lines typed at a prompt are recorded for the
+  workspace's audit log. Input typed at a **password prompt** (echo off) is
+  never recorded — this is filtered on the agent, in `shell/session.go`.
+  Known gap: raw-mode secret prompts (for example vim's `:X`) are recorded.
 
 ## Private-network uptime probes (opt-in)
 
@@ -149,8 +175,11 @@ also accepted):
 | `--secret-key` | `OPSERVO_SECRET_KEY` | set at registration |
 | `--enable-actions` | `OPSERVO_ENABLE_ACTIONS` | `true` (polling; see above) |
 | `--enable-probes` | `OPSERVO_ENABLE_PROBES` | `false` |
+| `--enable-shell` | `OPSERVO_ENABLE_SHELL` | `false` (see "Live terminal") |
 | `--auto-update` | `OPSERVO_AUTO_UPDATE` | `true` |
+| `--buffer-path` | `OPSERVO_BUFFER_PATH` | `~/.infrapilot/agent-buffer.db` (`/root/.infrapilot/…` under the installed unit) |
 | `--interval` | | `60s` |
+| `--dev` | | off (verbose logs, **no TLS verification** — local development only) |
 
 ## Updates and signing
 
