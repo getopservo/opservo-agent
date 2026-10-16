@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"strings"
 )
 
 // ScheduledInfo is the raw view of systemd timers and cron jobs, collected each
@@ -23,7 +24,7 @@ func (s *ScheduledCollector) Collect(ctx context.Context) (interface{}, error) {
 
 	if hasBinary("systemctl") {
 		if out, err := runCmd(ctx, "systemctl", "list-timers", "--all", "--no-pager"); err == nil {
-			info.Timers = capText(string(out), 16000)
+			info.Timers = capText(redactLines(string(out)), 16000)
 		}
 	}
 
@@ -41,8 +42,20 @@ func (s *ScheduledCollector) Collect(ctx context.Context) (interface{}, error) {
 			appendFile(&cron, "# user: "+e.Name(), "/var/spool/cron/crontabs/"+e.Name())
 		}
 	}
-	info.Cron = capText(cron.String(), 16000)
+	// Crontabs routinely carry `mysqldump -pSECRET`, `AWS_SECRET_ACCESS_KEY=…`
+	// and curl tokens inline; they are shipped raw text, so mask every line
+	// first (RedactSecrets is per-line: its generic rules stop at whitespace).
+	info.Cron = capText(redactLines(cron.String()), 16000)
 	return info, nil
+}
+
+// redactLines applies RedactSecrets to each line of a multi-line text.
+func redactLines(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = RedactSecrets(l)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // appendFile writes a header + a file's contents to buf, skipping unreadable files.

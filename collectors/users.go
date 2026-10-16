@@ -17,6 +17,9 @@ type SSHKey struct {
 }
 
 // UsersInfo: who is logged in and which SSH keys can access this server.
+// Sessions are the `who` lines with the login name and source address masked
+// (same maskUser/maskIP as the SSH findings) — the dashboard renders each line
+// as-is, so the shape is unchanged.
 type UsersInfo struct {
 	Sessions []string `json:"sessions"`
 	Keys     []SSHKey `json:"keys"`
@@ -32,7 +35,7 @@ func (u *UsersCollector) Collect(ctx context.Context) (interface{}, error) {
 
 	if out, err := runCmd(ctx, "who"); err == nil {
 		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			if l := strings.TrimSpace(line); l != "" {
+			if l := maskWhoLine(line); l != "" {
 				info.Sessions = append(info.Sessions, l)
 			}
 		}
@@ -63,10 +66,41 @@ func (u *UsersCollector) Collect(ctx context.Context) (interface{}, error) {
 			}
 			comment := ""
 			if len(fields) >= 3 {
-				comment = fields[len(fields)-1]
+				comment = maskKeyComment(fields[len(fields)-1])
 			}
 			info.Keys = append(info.Keys, SSHKey{User: user, Type: fields[0], Comment: comment})
 		}
 	}
 	return info, nil
+}
+
+// maskWhoLine turns one `who` line ("jane pts/0 2026-10-15 10:02 (203.0.113.7)")
+// into "ja** pts/0 2026-10-15 10:02 (203.0.*.*)": the login name and the
+// source host are personal data; the tty and time are what the dashboard
+// needs. Lines that do not look like `who` output are masked whole.
+func maskWhoLine(line string) string {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return ""
+	}
+	if len(fields) < 2 {
+		return maskUser(fields[0])
+	}
+	out := []string{maskUser(fields[0]), fields[1]}
+	for _, f := range fields[2:] {
+		if strings.HasPrefix(f, "(") && strings.HasSuffix(f, ")") {
+			f = "(" + maskIP(f[1:len(f)-1]) + ")"
+		}
+		out = append(out, f)
+	}
+	return strings.Join(out, " ")
+}
+
+// maskKeyComment masks the person in an authorized_keys comment ("jane@laptop"
+// → "ja**@laptop", "deploy-ci" → "de*******") while keeping it distinguishable.
+func maskKeyComment(c string) string {
+	if i := strings.Index(c, "@"); i >= 0 {
+		return maskUser(c[:i]) + c[i:]
+	}
+	return maskUser(c)
 }

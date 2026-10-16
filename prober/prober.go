@@ -28,8 +28,11 @@ import (
 // executor.commandSigningPublicKeyHex (the API signs both with one keypair,
 // domain-separated); duplicated as its own const so the packages stay
 // independent. An empty value would disable verification (same convention as
-// command/update signing).
-const probeSigningPublicKeyHex = "e1a4093b146bf6f33492aba76692362111b6abadeb8d46f90cd891fa9c4e1c7a"
+// command/update signing). A var so a per-environment build can link in its
+// key (-ldflags "-X github.com/getopservo/opservo-agent/prober.probeSigningPublicKeyHex=…";
+// api/Dockerfile sets it from the same COMMAND_SIGNING_PUBKEY build arg as the
+// executor, so the two can't drift apart).
+var probeSigningPublicKeyHex = "e1a4093b146bf6f33492aba76692362111b6abadeb8d46f90cd891fa9c4e1c7a"
 
 // maxChecks mirrors the API-side MAX_PROBES_PER_AGENT cap — enforced here too
 // so a malicious response can't turn the agent into a bulk scanner.

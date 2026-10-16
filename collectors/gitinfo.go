@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -69,15 +70,29 @@ func readGitInfo(ctx context.Context, dir string) (*GitInfo, bool) {
 	}
 
 	// Deploy freshness + drift — best-effort via the git binary (may be absent).
-	if ts, ok := gitCLI(ctx, dir, "log", "-1", "--format=%cI"); ok && ts != "" {
-		gi.CommittedAt = ts
-	}
-	if st, ok := gitCLITimeout(ctx, gitStatusTimeout, dir, "status", "--porcelain"); ok {
-		dirty := st != ""
-		gi.Dirty = &dirty
-		rememberDirty(gitDir, dirty)
-	} else if hasBinary("git") {
-		gi.Dirty, gi.DirtyUnknown = recallDirty(gitDir), true
+	//
+	// The CLI runs as root, and git obeys the repository's own config: a
+	// `.git/config` with `core.fsmonitor = /tmp/x.sh` (or hooksPath, pager,
+	// sshCommand, credential.helper) runs that program as whoever invokes git.
+	// That is the CVE-2022-24765 class: git's "dubious ownership" refusal exists
+	// precisely to stop root from honouring a config planted by another user,
+	// and `safe.directory=*` switches that refusal OFF. The config overrides in
+	// gitCLITimeout neuter the known knobs, but the real gate is ownership: the
+	// CLI only runs in a work tree owned by the agent's own user (root in
+	// production). Anything else keeps the file-based fields above and drops the
+	// two that need the binary — a missing commit date is cheaper than root
+	// executing a tenant's script.
+	if gitCLIAllowedFor(dir, gitDir) {
+		if ts, ok := gitCLI(ctx, dir, "log", "-1", "--format=%cI"); ok && ts != "" {
+			gi.CommittedAt = ts
+		}
+		if st, ok := gitCLITimeout(ctx, gitStatusTimeout, dir, "status", "--porcelain"); ok {
+			dirty := st != ""
+			gi.Dirty = &dirty
+			rememberDirty(gitDir, dirty)
+		} else if hasBinary("git") {
+			gi.Dirty, gi.DirtyUnknown = recallDirty(gitDir), true
+		}
 	}
 
 	if gi.Commit == "" && gi.Branch == "" && gi.Remote == "" {
@@ -86,9 +101,52 @@ func readGitInfo(ctx context.Context, dir string) (*GitInfo, bool) {
 	return gi, true
 }
 
+// gitCLIAllowed is the ownership gate for running the git binary: the work
+// tree must belong to the user the agent runs as. Pure so the rule is testable
+// (a test cannot chown). Root-owned trees pass for the production agent (uid
+// 0); a developer running `--dev` as themselves gets their own checkouts.
+func gitCLIAllowed(ownerUID, runningUID uint32) bool {
+	return ownerUID == runningUID
+}
+
+// gitCLIAllowedFor applies gitCLIAllowed to every path git would trust: the
+// directory it is started in, the `.git` entry it discovers (Lstat — a symlink
+// planted there counts as the planter's) and the resolved git dir whose config
+// it reads (differs from the entry for worktrees/submodules). Unknown owner =
+// refuse.
+func gitCLIAllowedFor(dir, gitDir string) bool {
+	me := uint32(os.Getuid())
+	paths := []string{dir, gitDir}
+	if entry, ok := findGitEntry(dir); ok {
+		paths = append(paths, entry)
+	}
+	for _, p := range paths {
+		uid, ok := fileOwnerUID(p)
+		if !ok || !gitCLIAllowed(uid, me) {
+			return false
+		}
+	}
+	return true
+}
+
+// fileOwnerUID returns the uid owning path (not following a final symlink).
+func fileOwnerUID(path string) (uint32, bool) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0, false
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return st.Uid, true
+}
+
 // gitCLI runs a read-only git command in workdir with a short timeout.
 // safe.directory=* avoids "dubious ownership" errors when the repo is owned by
-// a different user than the agent. Returns false if git is missing or errors.
+// a different user than the agent — which is only acceptable because
+// gitCLIAllowedFor has already required the tree to be ours (see readGitInfo).
+// Returns false if git is missing or errors.
 func gitCLI(ctx context.Context, workdir string, args ...string) (string, bool) {
 	return gitCLITimeout(ctx, 2*time.Second, workdir, args...)
 }
@@ -100,12 +158,24 @@ func gitCLI(ctx context.Context, workdir string, args ...string) (string, bool) 
 // root, since the agent runs as root), so the owner's next `git pull` or deploy
 // fails. Set as an env var, not --no-optional-locks: git older than 2.15 (e.g.
 // CentOS 7) rejects the flag but ignores the variable.
+//
+// The remaining -c overrides pin every config key that makes git execute a
+// program or talk to the network, so a repo config cannot: command-line -c
+// beats the repository's own value. Belt to the ownership gate's braces.
 func gitCLITimeout(ctx context.Context, timeout time.Duration, workdir string, args ...string) (string, bool) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	full := append([]string{"-C", workdir, "-c", "safe.directory=*"}, args...)
+	full := append([]string{
+		"-C", workdir,
+		"-c", "safe.directory=*",
+		"-c", "core.fsmonitor=false",
+		"-c", "core.hooksPath=/dev/null",
+		"-c", "core.sshCommand=/bin/false",
+		"-c", "credential.helper=",
+		"-c", "core.pager=cat",
+	}, args...)
 	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
 	out, err := cmd.Output()
 	if err != nil {
 		return "", false
@@ -113,29 +183,40 @@ func gitCLITimeout(ctx context.Context, timeout time.Duration, workdir string, a
 	return strings.TrimSpace(string(out)), true
 }
 
-// findGitDir returns the resolved .git directory for the work tree containing
-// dir, searching dir and up to 4 parent levels. Handles both a normal .git
-// directory and a .git *file* (worktrees/submodules: "gitdir: <path>").
-func findGitDir(dir string) (string, bool) {
+// findGitEntry returns the path of the `.git` entry (directory or file) for
+// the work tree containing dir, searching dir and up to 4 parent levels.
+func findGitEntry(dir string) (string, bool) {
 	d := dir
 	for i := 0; i < 5 && d != "" && d != "/"; i++ {
 		p := filepath.Join(d, ".git")
-		if info, err := os.Stat(p); err == nil {
-			if info.IsDir() {
-				return p, true
-			}
-			// .git file → points elsewhere (worktree/submodule).
-			if data, err := os.ReadFile(p); err == nil {
-				line := strings.TrimSpace(string(data))
-				if gp := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:")); strings.HasPrefix(line, "gitdir:") {
-					if !filepath.IsAbs(gp) {
-						gp = filepath.Join(d, gp)
-					}
-					return gp, true
-				}
-			}
+		if _, err := os.Stat(p); err == nil {
+			return p, true
 		}
 		d = filepath.Dir(d)
+	}
+	return "", false
+}
+
+// findGitDir returns the resolved .git directory for the work tree containing
+// dir. Handles both a normal .git directory and a .git *file*
+// (worktrees/submodules: "gitdir: <path>").
+func findGitDir(dir string) (string, bool) {
+	p, ok := findGitEntry(dir)
+	if !ok {
+		return "", false
+	}
+	if info, err := os.Stat(p); err == nil && info.IsDir() {
+		return p, true
+	}
+	// .git file → points elsewhere (worktree/submodule).
+	if data, err := os.ReadFile(p); err == nil {
+		line := strings.TrimSpace(string(data))
+		if gp := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:")); strings.HasPrefix(line, "gitdir:") {
+			if !filepath.IsAbs(gp) {
+				gp = filepath.Join(filepath.Dir(p), gp)
+			}
+			return gp, true
+		}
 	}
 	return "", false
 }

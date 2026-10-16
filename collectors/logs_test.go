@@ -1,9 +1,14 @@
 package collectors
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/getopservo/opservo-agent/buffer"
 )
 
 func TestNormLevel(t *testing.T) {
@@ -206,5 +211,73 @@ func TestIsEntryStart(t *testing.T) {
 		if isEntryStart(s) {
 			t.Errorf("expected continuation: %q", s)
 		}
+	}
+}
+
+func TestReadNewLines_FirstTailIsBounded(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "access.log")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ~3 MB of numbered lines, well past maxTailBytes.
+	var n int
+	for size := int64(0); size < 3*maxTailBytes; n++ {
+		line := fmt.Sprintf("line-%08d %s\n", n, strings.Repeat("x", 80))
+		if _, err := f.WriteString(line); err != nil {
+			t.Fatal(err)
+		}
+		size += int64(len(line))
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fi, _ := os.Stat(path)
+
+	buf, err := buffer.Open(filepath.Join(dir, "buf.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer buf.Close()
+	c := NewLogsCollector(buf)
+
+	lines := c.readNewLines(path)
+	if len(lines) != maxLinesPerSource {
+		t.Fatalf("got %d lines, want %d", len(lines), maxLinesPerSource)
+	}
+	// Every shipped line is complete (we skipped the partial one we landed
+	// in) and they are the newest ones.
+	for _, l := range lines {
+		if !strings.HasPrefix(l, "line-") || len(l) != len("line-00000000 ")+80 {
+			t.Fatalf("partial or corrupt line shipped: %q", l)
+		}
+	}
+	if want := fmt.Sprintf("line-%08d", n-1); !strings.HasPrefix(lines[len(lines)-1], want) {
+		t.Fatalf("last line = %q, want prefix %q", lines[len(lines)-1], want)
+	}
+	// Cursor now at EOF: a second read ships nothing new.
+	if off, size, _ := buf.Cursor(path); off != fi.Size() || size != fi.Size() {
+		t.Fatalf("cursor = (%d,%d), want (%d,%d)", off, size, fi.Size(), fi.Size())
+	}
+	if again := c.readNewLines(path); len(again) != 0 {
+		t.Fatalf("second read shipped %d lines", len(again))
+	}
+	// Append a line: only it ships.
+	af, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	af.WriteString("line-appended tail\n")
+	af.Close()
+	if got := c.readNewLines(path); len(got) != 1 || got[0] != "line-appended tail" {
+		t.Fatalf("after append got %v", got)
+	}
+
+	// No buffer: the 64 KB window applies and lines are still complete.
+	nb := NewLogsCollector(nil)
+	got := nb.readNewLines(path)
+	if len(got) == 0 || len(got) > maxLinesPerSource {
+		t.Fatalf("no-buffer read returned %d lines", len(got))
+	}
+	if !strings.HasPrefix(got[0], "line-") {
+		t.Fatalf("no-buffer first line partial: %q", got[0])
 	}
 }

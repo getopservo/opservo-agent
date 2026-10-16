@@ -427,6 +427,10 @@ register_agent() {
   local soft="${1:-}"
   local hostname payload resp machine_id
   hostname="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)"
+  # The hostname is interpolated into JSON below: escape the two characters
+  # that would break (or inject into) the string literal.
+  hostname="${hostname//\\/\\\\}"
+  hostname="${hostname//\"/\\\"}"
   # Stable per-instance id so the dashboard can flag the same box enrolled
   # twice, and so the agent can detect AMI clones (see instance_identity).
   machine_id="$(instance_identity)"
@@ -589,6 +593,21 @@ write_config() {
   if $SUDO grep -q '^OPSERVO_ENABLE_SHELL=true$' "${CONFIG_FILE}" 2>/dev/null; then
     shell_opt="true"
   fi
+  # Nor may it drop a local kill-switch (OPSERVO_ENABLE_ACTIONS=false,
+  # OPSERVO_AUTO_UPDATE=false) or any other OPSERVO_*/INFRAPILOT_* line the
+  # operator added by hand: every existing key the template does not set this
+  # run is carried over verbatim, after the template, and named on the way.
+  local preserved="" preserved_keys="" line key
+  while IFS= read -r line; do
+    key="${line%%=*}"
+    case "${key}" in
+      OPSERVO_API_URL|OPSERVO_AGENT_ID|OPSERVO_SECRET_KEY|OPSERVO_BUFFER_PATH|OPSERVO_ENABLE_PROBES|OPSERVO_ENABLE_SHELL|OPSERVO_MACHINE_ID) continue ;;
+      OPSERVO_ENROLL_KEY) case "${ENROLLMENT_TOKEN}" in fleet_*) continue ;; esac ;;
+    esac
+    preserved="${preserved}
+${line}"
+    preserved_keys="${preserved_keys}${preserved_keys:+ }${key}"
+  done < <($SUDO grep -E '^(OPSERVO|INFRAPILOT)_[A-Z0-9_]+=' "${CONFIG_FILE}" 2>/dev/null || true)
   # Recorded identity lets the agent detect AMI/template clones at startup.
   local identity extra
   identity="$(instance_identity)"
@@ -618,9 +637,12 @@ OPSERVO_ENABLE_PROBES=${probes}
 # dashboard must be on too. Set to true, then:
 #   systemctl restart infrapilot-agent
 OPSERVO_ENABLE_SHELL=${shell_opt}
-${extra}
+${extra}${preserved}
 EOF
   success "Wrote ${CONFIG_FILE}"
+  if [ -n "${preserved_keys}" ]; then
+    info "Preserved from existing config: ${preserved_keys}"
+  fi
 }
 
 # ── Step 4: systemd unit ──────────────────────────────────────────────────────

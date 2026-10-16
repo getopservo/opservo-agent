@@ -155,3 +155,40 @@ func TestRecallDirty_NeverReadIsNil(t *testing.T) {
 		t.Fatal("a work tree never read must not invent a value")
 	}
 }
+
+// The git CLI (run as root in production) must only ever start inside a work
+// tree owned by the agent's own user: a planted `.git/config` would otherwise
+// run a tenant's program as root (CVE-2022-24765 class, see readGitInfo).
+func TestGitCLIAllowed_OwnerGate(t *testing.T) {
+	if !gitCLIAllowed(0, 0) {
+		t.Error("root-owned tree refused for the root agent")
+	}
+	if gitCLIAllowed(1000, 0) {
+		t.Error("user-owned tree accepted for the root agent")
+	}
+	if gitCLIAllowed(0, 1000) {
+		t.Error("root-owned tree accepted for a non-root agent")
+	}
+	if !gitCLIAllowed(1000, 1000) {
+		t.Error("own tree refused for a --dev agent")
+	}
+	if gitCLIAllowed(1001, 1000) {
+		t.Error("another user's tree accepted for a --dev agent")
+	}
+}
+
+func TestGitCLIAllowedFor_PathsOwnedByUs(t *testing.T) {
+	dir := t.TempDir()
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Everything the test created is ours, so the gate opens.
+	if !gitCLIAllowedFor(dir, gitDir) {
+		t.Error("own temp repo refused")
+	}
+	// A path that cannot be stat'ed has no known owner → refuse.
+	if gitCLIAllowedFor(dir, filepath.Join(dir, "missing")) {
+		t.Error("unknown owner accepted")
+	}
+}

@@ -1,7 +1,7 @@
 # opservo-k8s-agent container image.
 # Build (from the agent directory):  docker build -f Dockerfile.k8s-agent -t opservo-k8s-agent:dev .
 # Pure-Go, CGO off, static binary on distroless — no shell, non-root.
-FROM golang:1.25-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

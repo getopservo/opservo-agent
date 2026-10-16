@@ -2,6 +2,7 @@ package collectors
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"os/user"
 	"regexp"
@@ -130,16 +131,23 @@ func (p *PostgresCollector) Collect(ctx context.Context) (interface{}, error) {
 	info := &PostgresInfo{Instances: []PostgresStat{}}
 
 	// 1. Operator-provided connection (read-only monitoring role; may be remote).
+	// The connection string is passed to psql as libpq PG* environment
+	// variables, never on argv (the password would show in `ps` otherwise —
+	// see pgconn.go). An unparseable line is skipped, never fed to argv.
 	if conn, err := os.ReadFile(pgConfigPath); err == nil {
-		if uri := strings.TrimSpace(firstNonCommentLine(string(conn))); uri != "" && hasBinary("psql") {
-			run := func(_ string, sql string) (string, error) { // URI already names the DB
-				out, err := runCmdTimeout(ctx, 6*time.Second, "psql", append([]string{uri}, psqlArgs("", sql)...)...)
-				return string(out), err
-			}
-			if st, ok := collectPostgres(run, false); ok {
-				st.Name, st.Source = "configured", "remote"
-				info.Available = true
-				info.Instances = append(info.Instances, st)
+		if line := strings.TrimSpace(firstNonCommentLine(string(conn))); line != "" && hasBinary("psql") {
+			if env, perr := pgConnEnv(line); perr != nil {
+				slog.Warn("postgres collector: ignoring "+pgConfigPath, "error", perr)
+			} else {
+				run := func(_ string, sql string) (string, error) { // connection already names the DB
+					out, err := runCmdEnvTimeout(ctx, 6*time.Second, env, "psql", psqlArgs("", sql)...)
+					return string(out), err
+				}
+				if st, ok := collectPostgres(run, false); ok {
+					st.Name, st.Source = "configured", "remote"
+					info.Available = true
+					info.Instances = append(info.Instances, st)
+				}
 			}
 		}
 	}

@@ -7,13 +7,16 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	gopsnet "github.com/shirou/gopsutil/v3/net"
+	"github.com/shirou/gopsutil/v3/process"
 )
 
 // AppInfo describes one detected web application.
 type AppInfo struct {
 	Path      string   `json:"path"`
 	Name      string   `json:"name,omitempty"` // package.json/composer.json name, else dir
-	Framework string   `json:"framework"`      // laravel | wordpress | nodejs | nextjs | … | php
+	Framework string   `json:"framework"`      // laravel | wordpress | nodejs | nextjs | rails | redmine | … | php
 	Version   string   `json:"version,omitempty"`
 	Git       *GitInfo `json:"git,omitempty"` // linked repo (branch/commit/remote), when present
 }
@@ -30,7 +33,7 @@ func (a *AppDetectCollector) Collect(ctx context.Context) (interface{}, error) {
 	apps := []AppInfo{}
 	seen := map[string]bool{}
 
-	for _, dir := range candidateAppDirs() {
+	for _, dir := range candidateAppDirs(ctx) {
 		if ctx.Err() != nil {
 			break
 		}
@@ -53,30 +56,137 @@ func (a *AppDetectCollector) Collect(ctx context.Context) (interface{}, error) {
 // large filesystem scan.
 const maxCandidateAppDirs = 2000
 
-// candidateAppDirs returns the web roots to inspect: /var/www and each
-// /home/*/public_html, plus their subdirectories two levels down. Two levels
-// covers the common reseller/shared-hosting layout where each customer gets
-// their own directory (e.g. /var/www/clients/client1), one level deeper than
-// a single app root (e.g. /var/www/myapp).
-func candidateAppDirs() []string {
-	var bases []string
-	bases = append(bases, "/var/www")
+// candidateAppDirs returns the directories to inspect, most specific first
+// (so the walk cap can never crowd them out):
+//
+//  1. where the server says its sites live — each vhost's document root and
+//     its parent (Rails / Laravel serve <app>/public), and Passenger app roots;
+//  2. the working directory of every process listening on a TCP port — this
+//     is how PM2 / Puma / Gunicorn / Java apps outside /var/www are found;
+//  3. well-known install paths (Redmine packages, one level of /opt);
+//  4. a walk of the usual web roots (/var/www, /srv, ~/public_html).
+func candidateAppDirs(ctx context.Context) []string {
+	var exact []string
+	for _, v := range vhostDetails() {
+		if v.AppRoot != "" {
+			exact = append(exact, v.AppRoot)
+		}
+		if v.Root != "" {
+			exact = append(exact, v.Root, filepath.Dir(v.Root))
+		}
+	}
+	exact = append(exact, listeningProcessDirs(ctx)...)
+	exact = append(exact, wellKnownAppDirs...)
+	if matches, err := filepath.Glob("/opt/*"); err == nil {
+		exact = append(exact, matches...)
+	}
+
+	bases := []string{"/var/www", "/srv"}
 	if matches, err := filepath.Glob("/home/*/public_html"); err == nil {
 		bases = append(bases, matches...)
 	}
-	return candidateAppDirsFrom(bases)
+	return mergeCandidateDirs(exact, candidateAppDirsFrom(bases))
 }
 
-// candidateAppDirsFrom does the actual two-level walk; split out from
-// candidateAppDirs so tests can pass a temp-dir base instead of real
-// filesystem roots.
+// wellKnownAppDirs are package-manager / installer locations of web apps that
+// never live under a web root (Debian's redmine package, the usual tarball
+// and Bitnami installs).
+var wellKnownAppDirs = []string{
+	"/usr/share/redmine",
+	"/var/lib/redmine",
+	"/opt/redmine",
+	"/opt/bitnami/redmine",
+	"/opt/bitnami/apps/redmine/htdocs",
+}
+
+// mergeCandidateDirs puts the exact dirs first, drops filesystem roots,
+// non-directories and duplicates, and applies the overall cap.
+func mergeCandidateDirs(exact, walked []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(d string) {
+		if len(out) >= maxCandidateAppDirs || d == "" {
+			return
+		}
+		d = filepath.Clean(d)
+		if d == "/" || seen[d] {
+			return
+		}
+		if info, err := os.Stat(d); err != nil || !info.IsDir() {
+			return
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	for _, d := range exact {
+		add(d)
+	}
+	for _, d := range walked {
+		add(d)
+	}
+	return out
+}
+
+// listeningProcessDirs returns the working directory of each process that
+// listens on a TCP port. An app server's cwd is (almost always) its app root,
+// whatever started it — PM2, systemd, supervisor, a container's host process.
+// The agent runs as root, so /proc/<pid>/cwd is readable. Best-effort.
+func listeningProcessDirs(ctx context.Context) []string {
+	conns, err := gopsnet.ConnectionsWithContext(ctx, "tcp")
+	if err != nil {
+		return nil
+	}
+	seenPid := map[int32]bool{}
+	var dirs []string
+	for _, c := range conns {
+		if c.Status != "LISTEN" || c.Pid <= 0 || seenPid[c.Pid] {
+			continue
+		}
+		seenPid[c.Pid] = true
+		p, err := process.NewProcessWithContext(ctx, c.Pid)
+		if err != nil {
+			continue
+		}
+		if cwd, err := p.CwdWithContext(ctx); err == nil && cwd != "" && cwd != "/" {
+			dirs = append(dirs, cwd)
+		}
+	}
+	return dirs
+}
+
+// appDirDepth is how many levels below each base the walk goes: base/app
+// (1), base/clients/client1 (2, shared hosting), base/html/project/app (3).
+const appDirDepth = 3
+
+// skipWalkDirs are never worth descending into: dependency trees, caches and
+// VCS metadata hold thousands of directories and no app roots.
+var skipWalkDirs = map[string]bool{
+	"node_modules": true, "vendor": true, "bower_components": true, "__pycache__": true,
+	"site-packages": true, "storage": true, "cache": true, "tmp": true, "log": true, "logs": true,
+}
+
+// candidateAppDirsFrom does the actual walk; split out from candidateAppDirs
+// so tests can pass a temp-dir base instead of real filesystem roots.
 func candidateAppDirsFrom(bases []string) []string {
 	var dirs []string
-	add := func(dir string) bool {
+	var walk func(dir string, depth int) bool
+	walk = func(dir string, depth int) bool {
 		if len(dirs) >= maxCandidateAppDirs {
 			return false
 		}
 		dirs = append(dirs, dir)
+		if depth == appDirDepth {
+			return true
+		}
+		for _, sub := range subDirs(dir) {
+			name := filepath.Base(sub)
+			if strings.HasPrefix(name, ".") || skipWalkDirs[name] {
+				continue
+			}
+			if !walk(sub, depth+1) {
+				return false
+			}
+		}
 		return true
 	}
 
@@ -85,18 +195,8 @@ func candidateAppDirsFrom(bases []string) []string {
 		if err != nil || !info.IsDir() {
 			continue
 		}
-		if !add(base) {
+		if !walk(base, 0) {
 			return dirs
-		}
-		for _, level1 := range subDirs(base) {
-			if !add(level1) {
-				return dirs
-			}
-			for _, level2 := range subDirs(level1) {
-				if !add(level2) {
-					return dirs
-				}
-			}
 		}
 	}
 	return dirs
@@ -325,6 +425,9 @@ func rubyFramework(dir string) (string, string, bool) {
 		return "", "", false
 	}
 	if railsGemRe.Match(data) {
+		if v, ok := redmineVersion(dir); ok {
+			return "redmine", v, true
+		}
 		return "rails", railsVersion(dir), true
 	}
 	return "ruby", rubyVersion(dir, data), true
@@ -345,6 +448,38 @@ func rubyVersion(dir string, gemfile []byte) string {
 		return string(m[1])
 	}
 	return ""
+}
+
+var redmineVerPartRe = regexp.MustCompile(`(?m)^\s*(MAJOR|MINOR|TINY)\s*=\s*(\d+)`)
+
+// redmineVersion recognises a Redmine install (a Rails app shipping
+// lib/redmine/version.rb, or lib/redmine.rb on very old releases) and reads
+// MAJOR.MINOR.TINY from it. ok=false means "not Redmine".
+func redmineVersion(dir string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(dir, "lib", "redmine", "version.rb"))
+	if err != nil {
+		if fileExists(filepath.Join(dir, "lib", "redmine.rb")) {
+			return "", true
+		}
+		return "", false
+	}
+	parts := map[string]string{}
+	for _, m := range redmineVerPartRe.FindAllStringSubmatch(string(data), -1) {
+		if _, dup := parts[m[1]]; !dup {
+			parts[m[1]] = m[2]
+		}
+	}
+	if parts["MAJOR"] == "" {
+		return "", true
+	}
+	v := parts["MAJOR"]
+	if parts["MINOR"] != "" {
+		v += "." + parts["MINOR"]
+		if parts["TINY"] != "" {
+			v += "." + parts["TINY"]
+		}
+	}
+	return v, true
 }
 
 var railsGemRe = regexp.MustCompile(`(?m)^\s*gem\s+["']rails["']`)

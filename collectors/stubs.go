@@ -119,7 +119,7 @@ func (p *ProcessCollector) Collect(ctx context.Context) (interface{}, error) {
 			CPU:     cpuPct,
 			MemMB:   memMB,
 			Status:  status,
-			CmdLine: cmdline,
+			CmdLine: RedactSecrets(cmdline), // `mysql -pHunter2`, `--token …` are visible in ps to anyone; not to the cloud
 		})
 	}
 
@@ -336,7 +336,7 @@ func (n *NetworkCollector) Collect(ctx context.Context) (interface{}, error) {
 					if len(cmd) > 512 {
 						cmd = cmd[:512]
 					}
-					lp.Cmdline = cmd
+					lp.Cmdline = RedactSecrets(cmd)
 				}
 				if cwd, err := p.CwdWithContext(ctx); err == nil {
 					lp.Cwd = cwd

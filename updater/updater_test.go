@@ -92,3 +92,70 @@ func TestNew_DefaultsAndAsset(t *testing.T) {
 		t.Errorf("unexpected asset name: %q", u.asset)
 	}
 }
+
+func TestCheckManifestFreshness(t *testing.T) {
+	cases := []struct {
+		name     string
+		gen      string
+		last     string
+		wantLast string
+		wantErr  bool
+	}{
+		{"no field, no state", "", "", "", false},
+		{"no field keeps state", "", "2026-10-01T00:00:00Z", "2026-10-01T00:00:00Z", false},
+		{"first accepted", "2026-10-15T10:00:00Z", "", "2026-10-15T10:00:00Z", false},
+		{"newer accepted", "2026-10-16T10:00:00Z", "2026-10-15T10:00:00Z", "2026-10-16T10:00:00Z", false},
+		{"equal accepted", "2026-10-15T10:00:00Z", "2026-10-15T10:00:00Z", "2026-10-15T10:00:00Z", false},
+		{"normalised to UTC", "2026-10-15T15:30:00+05:30", "", "2026-10-15T10:00:00Z", false},
+		{"older refused", "2026-10-14T10:00:00Z", "2026-10-15T10:00:00Z", "2026-10-15T10:00:00Z", true},
+		{"malformed refused", "yesterday", "2026-10-15T10:00:00Z", "2026-10-15T10:00:00Z", true},
+		{"corrupt state ignored", "2026-10-15T10:00:00Z", "garbage", "2026-10-15T10:00:00Z", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := map[string]string{"infrapilot-agent-linux-amd64": "abc"}
+			if c.gen != "" {
+				m["generated_at"] = c.gen
+			}
+			got, err := checkManifestFreshness(m, c.last)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, c.wantErr)
+			}
+			if got != c.wantLast {
+				t.Fatalf("persist value = %q, want %q", got, c.wantLast)
+			}
+		})
+	}
+}
+
+func TestUpdater_StatePersistsAndRefusesRollback(t *testing.T) {
+	dir := t.TempDir()
+	u := New("https://api.example", 0).WithStateDir(dir)
+	if u.readState() != "" {
+		t.Fatal("fresh state dir must be empty")
+	}
+	if err := u.writeState("2026-10-15T10:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if got := u.readState(); got != "2026-10-15T10:00:00Z" {
+		t.Fatalf("readState = %q", got)
+	}
+	// An older signed manifest replayed later must be refused using the
+	// persisted value, a newer one accepted and persisted.
+	if _, err := checkManifestFreshness(map[string]string{"generated_at": "2026-10-10T00:00:00Z"}, u.readState()); err == nil {
+		t.Fatal("rollback not refused")
+	}
+	next, err := checkManifestFreshness(map[string]string{"generated_at": "2026-10-20T00:00:00Z"}, u.readState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := u.writeState(next); err != nil {
+		t.Fatal(err)
+	}
+	if got := u.readState(); got != "2026-10-20T00:00:00Z" {
+		t.Fatalf("state after accept = %q", got)
+	}
+	if New("x", 0).stateDir != "" {
+		t.Fatal("anti-rollback must be off without a state dir")
+	}
+}

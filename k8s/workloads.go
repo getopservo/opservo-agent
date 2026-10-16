@@ -11,6 +11,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/getopservo/opservo-agent/collectors"
 )
 
 const (
@@ -209,10 +211,23 @@ func tailPreviousLog(ctx context.Context, c *Clients, ns, pod, container string)
 		b, _ := io.ReadAll(io.LimitReader(rc, logTailBytes))
 		rc.Close()
 		if s := strings.TrimSpace(string(b)); s != "" {
-			return s
+			// A crashing app dumps its config/env into the stack trace more
+			// often than not; same per-line masking the Linux log collector
+			// applies before anything leaves the box.
+			return redactLines(s)
 		}
 	}
 	return ""
+}
+
+// redactLines runs collectors.RedactSecrets over each line of a log tail
+// (its generic rules stop at whitespace, so a line at a time is the unit).
+func redactLines(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = collectors.RedactSecrets(l)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func oneLine(s string) string {

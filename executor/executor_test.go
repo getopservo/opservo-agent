@@ -3,7 +3,9 @@ package executor
 import (
 	"crypto/ed25519"
 	"encoding/hex"
+	"strings"
 	"testing"
+	"time"
 )
 
 // The embedded key must be a real 32-byte Ed25519 public key, or command
@@ -111,5 +113,40 @@ func TestVerifyCancelSignature_InteropWithTypeScriptSigner(t *testing.T) {
 	c := pendingCommand{ID: "cancel", Command: cmdID, ExpiresAt: "agent-1", Signature: sig}
 	if verifyCommandSignature(pubHex, "x", c) == nil {
 		t.Error("cancel signature accepted as a command signature")
+	}
+}
+
+// A valid signature on a command whose expires_at has passed must still be
+// refused (same fixture as the interop test: the TypeScript signer signed
+// expires_at 2026-01-01T00:10:00.000Z, which is now in the past).
+func TestCheckCommandExpiry_RefusesExpiredSignedCommand(t *testing.T) {
+	const pubHex = "1d53ae157ea41fc42412ffa3d865cce96cd1b57441bdde097c91f00dea5b217e"
+	c := pendingCommand{
+		ID:        "cmd-xlang",
+		Command:   "echo interop",
+		ExpiresAt: "2026-01-01T00:10:00.000Z",
+		Signature: "d23034d19ccd836b925563cf6394a07c29a053855beffa0587435eb3648b0e0c67f54a8068c7353e781af28d2b44a0ca8ca4c862f2049e3e85f9edbf599d050e",
+	}
+	if err := verifyCommandSignature(pubHex, "agent-xlang", c); err != nil {
+		t.Fatalf("fixture signature no longer verifies: %v", err)
+	}
+	if err := checkCommandExpiry(c, time.Now()); err == nil {
+		t.Error("expired command accepted")
+	} else if !strings.Contains(err.Error(), "command expired") {
+		t.Errorf("reason should say the command expired, got %q", err)
+	}
+	// Still accepted while the deadline is ahead.
+	if err := checkCommandExpiry(c, time.Date(2026, 1, 1, 0, 9, 59, 0, time.UTC)); err != nil {
+		t.Errorf("unexpired command refused: %v", err)
+	}
+	// Exactly at the deadline is expired (not before).
+	if checkCommandExpiry(c, time.Date(2026, 1, 1, 0, 10, 0, 0, time.UTC)) == nil {
+		t.Error("command at its deadline accepted")
+	}
+	// The API always sets expires_at, so empty/garbage is refused, never run.
+	for _, bad := range []string{"", "soon", "2026-01-01"} {
+		if checkCommandExpiry(pendingCommand{ExpiresAt: bad}, time.Now()) == nil {
+			t.Errorf("expires_at %q accepted", bad)
+		}
 	}
 }

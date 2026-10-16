@@ -3,10 +3,7 @@ package sender
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +14,7 @@ import (
 	"time"
 
 	"github.com/getopservo/opservo-agent/collectors"
+	"github.com/getopservo/opservo-agent/reqsign"
 )
 
 // robustTransport reconnects cleanly after an API blip (e.g. a deploy recreating
@@ -92,8 +90,6 @@ func (s *Sender) Send(ctx context.Context, payload *collectors.Payload) error {
 // Returns the response body — the API may hand back work in it (e.g. signed
 // probe assignments for opted-in agents).
 func (s *Sender) SendRaw(ctx context.Context, body []byte) ([]byte, error) {
-	sig := sign(body, s.secretKey)
-
 	req, err := http.NewRequestWithContext(ctx,
 		http.MethodPost,
 		s.apiURL+"/api/v1/agents/"+s.agentID+"/heartbeat",
@@ -105,8 +101,8 @@ func (s *Sender) SendRaw(ctx context.Context, body []byte) ([]byte, error) {
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Agent-ID", s.agentID)
-	req.Header.Set("X-Signature", sig)
-	req.Header.Set("X-Timestamp", time.Now().UTC().Format(time.RFC3339))
+	// v2 HMAC: timestamp + nonce bound into the signature (reqsign).
+	reqsign.Apply(req.Header, s.secretKey, body)
 
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -115,6 +111,11 @@ func (s *Sender) SendRaw(ctx context.Context, body []byte) ([]byte, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		if resp.StatusCode == http.StatusUnauthorized {
+			// Distinguish "clock is off" (fixable with NTP) from a bad key.
+			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			reqsign.WarnClockSkew(resp.StatusCode, errBody, "heartbeat")
+		}
 		return nil, &StatusError{Code: resp.StatusCode}
 	}
 
@@ -174,13 +175,6 @@ func RegisterKind(apiURL, agentVersion string, devMode bool, enrollmentToken, ma
 	}
 
 	return result.AgentID, result.SecretKey, nil
-}
-
-// sign creates an HMAC-SHA256 signature of the payload body.
-func sign(body []byte, secret string) string {
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write(body)
-	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func getHostname() string {

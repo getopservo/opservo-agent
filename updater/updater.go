@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -43,14 +44,29 @@ const (
 // need the offline signing key). Set it together with build-time signing
 // (AGENT_SIGNING_KEY). An empty value disables verification — only do that
 // for a private build that you sign some other way.
-const signingPublicKeyHex = "b7f1a9b29bd8ea7982a3e21b39a119ca4dbdfd065cf7bcdba486487d0bb0bc76"
+//
+// It is a var, not a const, so a build for another environment can swap in
+// that environment's key at link time without touching the source:
+//
+//	go build -ldflags "-X github.com/getopservo/opservo-agent/updater.signingPublicKeyHex=<64 hex>"
+//
+// (api/Dockerfile does this from the AGENT_SIGNING_PUBKEY build arg; staging
+// has its own keypair so the production seed never has to sit on a box that
+// also runs pull-request CI.)
+var signingPublicKeyHex = "b7f1a9b29bd8ea7982a3e21b39a119ca4dbdfd065cf7bcdba486487d0bb0bc76"
 
 type Updater struct {
 	apiURL   string
 	interval time.Duration
 	client   *http.Client
 	asset    string
+	stateDir string // where the last accepted manifest timestamp is kept ("" = no anti-rollback)
 }
+
+// manifestStateFile (inside stateDir) holds the `generated_at` of the newest
+// manifest this agent has accepted, so a replayed OLD signed manifest can't
+// roll the fleet back to a signed-but-vulnerable build.
+const manifestStateFile = "update-manifest.state"
 
 func New(apiURL string, interval time.Duration) *Updater {
 	if interval <= 0 {
@@ -62,6 +78,14 @@ func New(apiURL string, interval time.Duration) *Updater {
 		client:   &http.Client{Timeout: 90 * time.Second},
 		asset:    "infrapilot-agent-linux-" + runtime.GOARCH,
 	}
+}
+
+// WithStateDir enables anti-rollback: the newest accepted manifest
+// `generated_at` is persisted in dir (same directory as the SQLite buffer) and
+// any later manifest dated before it is refused. Missing field = allowed.
+func (u *Updater) WithStateDir(dir string) *Updater {
+	u.stateDir = strings.TrimSpace(dir)
+	return u
 }
 
 // Run blocks, checking for updates shortly after start and then every interval.
@@ -163,7 +187,69 @@ func (u *Updater) fetchManifest(ctx context.Context) (map[string]string, error) 
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, err
 	}
+	// Anti-rollback: a signature proves the manifest is OURS, not that it is
+	// CURRENT. Refuse one older than the newest we have already accepted.
+	if u.stateDir != "" {
+		last := u.readState()
+		accepted, err := checkManifestFreshness(m, last)
+		if err != nil {
+			slog.Warn("refusing update manifest", "error", err)
+			return nil, err
+		}
+		if accepted != last {
+			if err := u.writeState(accepted); err != nil {
+				slog.Warn("could not persist accepted manifest timestamp", "error", err)
+			}
+		}
+	}
 	return m, nil
+}
+
+// checkManifestFreshness compares the manifest's optional `generated_at`
+// (RFC 3339) with the last accepted value and returns the value to persist.
+// Pure, so it is unit-tested. Rules: no field → allowed, state unchanged
+// (backward compatible with manifests built before the field existed); a
+// malformed field → refused (our own build emitted it, so fail loudly); an
+// unreadable persisted value is ignored and overwritten; older than persisted →
+// refused; equal or newer → accepted.
+func checkManifestFreshness(m map[string]string, last string) (string, error) {
+	gen := strings.TrimSpace(m["generated_at"])
+	if gen == "" {
+		return last, nil
+	}
+	t, err := time.Parse(time.RFC3339, gen)
+	if err != nil {
+		return last, fmt.Errorf("manifest generated_at %q is not RFC 3339: %w", gen, err)
+	}
+	if lt, lerr := time.Parse(time.RFC3339, strings.TrimSpace(last)); lerr == nil && t.Before(lt) {
+		return last, fmt.Errorf("manifest generated_at %s is older than the last accepted %s — possible rollback", t.UTC().Format(time.RFC3339), lt.UTC().Format(time.RFC3339))
+	}
+	return t.UTC().Format(time.RFC3339), nil
+}
+
+func (u *Updater) readState() string {
+	b, err := os.ReadFile(filepath.Join(u.stateDir, manifestStateFile))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// writeState persists the accepted timestamp atomically (tmp + rename).
+func (u *Updater) writeState(v string) error {
+	if err := os.MkdirAll(u.stateDir, 0o755); err != nil {
+		return err
+	}
+	dst := filepath.Join(u.stateDir, manifestStateFile)
+	tmp := dst + ".tmp"
+	if err := os.WriteFile(tmp, []byte(v+"\n"), 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // verifyManifestSig fetches /download/manifest.json.sig and Ed25519-verifies it

@@ -5,10 +5,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -94,7 +96,9 @@ func (s *ServiceCollector) Collect(ctx context.Context) (interface{}, error) {
 		report.DockerInstalled = true
 		report.Services = append(report.Services, collectDocker(ctx)...)
 	}
-	if hasBinary("pm2") {
+	// PM2 is found by its daemon process, not by `pm2` on root's PATH: most
+	// installs are per-user (nvm, ~/.npm-global) and invisible to root.
+	if len(findPM2Daemons()) > 0 || hasBinary("pm2") {
 		report.PM2Installed = true
 		report.Services = append(report.Services, collectPM2(ctx)...)
 	}
@@ -114,10 +118,40 @@ func hasBinary(name string) bool {
 	return err == nil
 }
 
+// defaultCmdTimeout bounds any collector command whose context carries no
+// deadline of its own, so a wedged `docker ps` / `journalctl` can never hold
+// a heartbeat open (the registry's per-collector deadline is the outer bound).
+const defaultCmdTimeout = 15 * time.Second
+
 // runCmd executes a command with the collector context and returns stdout.
 // stderr is discarded; a non-zero exit returns the error so callers can skip.
 func runCmd(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return runCmdEnv(ctx, nil, name, args...)
+}
+
+// runCmdEnv is runCmd with extra environment variables for the child only
+// (e.g. libpq PG* connection settings, which must never appear in argv).
+// The command runs in its own process group and the WHOLE group is killed when
+// the context ends, so a child that outlives `sh -c` cannot keep the stdout
+// pipe open and block Wait; WaitDelay is the backstop for I/O copying.
+func runCmdEnv(ctx context.Context, extraEnv []string, name string, args ...string) ([]byte, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultCmdTimeout)
+		defer cancel()
+	}
 	cmd := exec.CommandContext(ctx, name, args...)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return nil
+	}
+	cmd.WaitDelay = 2 * time.Second
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
@@ -413,45 +447,23 @@ func dockerRestartCounts(ctx context.Context, ids []string) map[string]int {
 }
 
 // ── PM2 ──────────────────────────────────────────────────────────────────────
-
-type pm2Process struct {
-	Name string `json:"name"`
-	PM2  struct {
-		Status   string `json:"status"`
-		PMUptime int64  `json:"pm_uptime"`
-		Restarts int    `json:"restart_time"`
-	} `json:"pm2_env"`
-	Monit struct {
-		Memory uint64  `json:"memory"`
-		CPU    float64 `json:"cpu"`
-	} `json:"monit"`
-}
+// Discovery and querying live in pm2.go.
 
 func collectPM2(ctx context.Context) []ServiceInfo {
-	out, err := runCmd(ctx, "pm2", "jlist")
-	if err != nil {
-		return nil
-	}
-	// pm2 may print a banner before the JSON; start parsing at the first '['.
-	if i := bytes.IndexByte(out, '['); i > 0 {
-		out = out[i:]
-	}
-
-	var procs []pm2Process
-	if err := json.Unmarshal(out, &procs); err != nil {
-		return nil
-	}
-
 	var services []ServiceInfo
-	for _, p := range procs {
-		services = append(services, ServiceInfo{
-			Name:         p.Name,
+	for _, a := range sharedPM2Apps(ctx) {
+		svc := ServiceInfo{
+			Name:         a.Name,
 			Type:         "pm2",
-			Status:       p.PM2.Status,
-			CPUPercent:   p.Monit.CPU,
-			MemoryBytes:  p.Monit.Memory,
-			RestartCount: p.PM2.Restarts,
-		})
+			Status:       a.PM2.Status,
+			CPUPercent:   a.Monit.CPU,
+			MemoryBytes:  a.Monit.Memory,
+			RestartCount: a.PM2.Restarts,
+		}
+		if a.User != "" {
+			svc.Description = "PM2 app run by " + a.User
+		}
+		services = append(services, svc)
 	}
 	return services
 }

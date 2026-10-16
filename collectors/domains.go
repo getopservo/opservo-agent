@@ -15,9 +15,20 @@ import (
 
 // DomainInfo describes a virtual host and the state of its TLS certificate.
 type DomainInfo struct {
-	Domain          string     `json:"domain"`
-	Server          string     `json:"server"`         // nginx | apache
-	Root            string     `json:"root,omitempty"` // vhost document root → correlate to an app
+	Domain string `json:"domain"`
+	Server string `json:"server"`         // nginx | apache | cloudflared (tunnel only)
+	Root   string `json:"root,omitempty"` // vhost document root → correlate to an app
+	// Where the vhost sends requests when it is a reverse proxy (ProxyPass /
+	// proxy_pass), e.g. "http://127.0.0.1:3000" or "http://192.0.2.27:80".
+	// Set when the site is served by another process or another server, so
+	// the dashboard can say so instead of implying "no app here".
+	Upstream string `json:"upstream,omitempty"`
+	// Application root declared for an in-server app runner (PassengerAppRoot /
+	// passenger_app_root), when present.
+	AppRoot string `json:"app_root,omitempty"`
+	// Cloudflare Tunnel service this hostname is routed to (e.g.
+	// "http://localhost:8080"), when the site is published through cloudflared.
+	Tunnel          string     `json:"tunnel,omitempty"`
 	SSLExpiry       *time.Time `json:"ssl_expiry,omitempty"`
 	DaysUntilExpiry *int       `json:"days_until_expiry,omitempty"`
 	SSLError        string     `json:"ssl_error,omitempty"`
@@ -44,6 +55,12 @@ func (d *DomainCollector) Collect(ctx context.Context) (interface{}, error) {
 			found[domain] = "apache"
 		}
 	}
+	tunnels := tunnelRoutes(ctx)
+	for domain := range tunnels {
+		if _, exists := found[domain]; !exists {
+			found[domain] = "cloudflared"
+		}
+	}
 
 	domains := make([]string, 0, len(found))
 	for domain := range found {
@@ -51,7 +68,7 @@ func (d *DomainCollector) Collect(ctx context.Context) (interface{}, error) {
 	}
 	sort.Strings(domains)
 
-	roots := vhostRoots() // domain -> document root, best-effort
+	details := vhostDetails() // domain -> root / upstream / app root, best-effort
 
 	results := make([]DomainInfo, len(domains))
 	sem := make(chan struct{}, 8) // bound concurrent TLS dials
@@ -63,7 +80,9 @@ func (d *DomainCollector) Collect(ctx context.Context) (interface{}, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			info := checkSSL(ctx, domain, found[domain])
-			info.Root = roots[domain]
+			v := details[domain]
+			info.Root, info.Upstream, info.AppRoot = v.Root, v.Upstream, v.AppRoot
+			info.Tunnel = tunnels[domain]
 			results[i] = info
 		}(i, domain)
 	}
@@ -162,30 +181,73 @@ func parseVhosts(glob string, re *regexp.Regexp) map[string]struct{} {
 	return domains
 }
 
-// ── vhost document roots ─────────────────────────────────────────────────────
+// ── vhost document roots, proxy targets and app roots ────────────────────────
 
 var (
-	nginxBlockRe  = regexp.MustCompile(`^\s*server\s*\{`)
-	nginxRootRe   = regexp.MustCompile(`(?m)^\s*root\s+([^;]+);`)
-	apacheBlockRe = regexp.MustCompile(`(?i)^\s*<VirtualHost`)
-	apacheRootRe  = regexp.MustCompile(`(?mi)^\s*DocumentRoot\s+(.+)$`)
+	nginxBlockRe      = regexp.MustCompile(`^\s*server\s*\{`)
+	nginxRootRe       = regexp.MustCompile(`^\s*root\s+([^;]+);`)
+	nginxProxyRe      = regexp.MustCompile(`^\s*(?:proxy_pass|uwsgi_pass|grpc_pass)\s+([^;]+);`)
+	nginxAppRootRe    = regexp.MustCompile(`^\s*passenger_app_root\s+([^;]+);`)
+	apacheBlockRe     = regexp.MustCompile(`(?i)^\s*<VirtualHost`)
+	apacheRootRe      = regexp.MustCompile(`(?i)^\s*DocumentRoot\s+(.+)$`)
+	apacheProxyRe     = regexp.MustCompile(`(?i)^\s*ProxyPass(?:Match)?\s+(\S+)\s+(\S+)`)
+	apacheAppRootRe   = regexp.MustCompile(`(?i)^\s*PassengerAppRoot\s+(.+)$`)
+	urlUserinfoRe     = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@`)
+	nginxLocationRe   = regexp.MustCompile(`^\s*location\s`)
+	nginxLocationRoot = regexp.MustCompile(`^\s*location\s+/\s*\{`)
 )
 
-// vhostRoots maps each served domain to its document root, so the API can tell
-// which detected app a domain fronts. Best-effort: it pairs server_name/root
-// directives within the same vhost block via a small line state machine (real
-// brace parsing isn't needed just to find the root).
-func vhostRoots() map[string]string {
-	roots := map[string]string{}
-	pairVhostRoots(roots, nginxBlockRe, nginxServerNameRe, nginxRootRe,
-		"/etc/nginx/sites-enabled/*", "/etc/nginx/conf.d/*.conf")
-	pairVhostRoots(roots, apacheBlockRe, apacheServerRe, apacheRootRe,
-		"/etc/apache2/sites-enabled/*", "/etc/apache2/conf.d/*.conf",
-		"/etc/httpd/conf.d/*.conf", "/etc/httpd/conf/httpd.conf")
-	return roots
+// vhostDetail is what one vhost block says about where its site lives.
+type vhostDetail struct {
+	Root     string // DocumentRoot / root
+	Upstream string // reverse-proxy target, credentials stripped
+	AppRoot  string // PassengerAppRoot / passenger_app_root
 }
 
-func pairVhostRoots(out map[string]string, blockRe, nameRe, rootRe *regexp.Regexp, globs ...string) {
+type vhostSyntax struct {
+	block, name, root, appRoot *regexp.Regexp
+	// proxy returns (target, isSiteRoot) for a proxy directive line, or ok=false.
+	proxy func(line string) (target string, isSiteRoot bool, ok bool)
+}
+
+var nginxSyntax = vhostSyntax{
+	block: nginxBlockRe, name: nginxServerNameRe, root: nginxRootRe, appRoot: nginxAppRootRe,
+	proxy: func(line string) (string, bool, bool) {
+		m := nginxProxyRe.FindStringSubmatch(line)
+		if m == nil {
+			return "", false, false
+		}
+		return m[1], false, true
+	},
+}
+
+var apacheSyntax = vhostSyntax{
+	block: apacheBlockRe, name: apacheServerRe, root: apacheRootRe, appRoot: apacheAppRootRe,
+	proxy: func(line string) (string, bool, bool) {
+		m := apacheProxyRe.FindStringSubmatch(line)
+		if m == nil || m[2] == "!" {
+			return "", false, false
+		}
+		path := strings.Trim(m[1], `"'`)
+		return m[2], path == "/" || path == "^/(.*)$" || path == "^/(.*)", true
+	},
+}
+
+// vhostDetails maps each served domain to its document root, proxy target and
+// app root, so the API can tell which detected app a domain fronts — or that
+// the site is served from somewhere else. Best-effort: it pairs directives
+// within the same vhost block via a small line state machine (real brace
+// parsing isn't needed for this).
+func vhostDetails() map[string]vhostDetail {
+	out := map[string]vhostDetail{}
+	pairVhostDetails(out, nginxSyntax, "/etc/nginx/sites-enabled/*", "/etc/nginx/conf.d/*.conf")
+	pairVhostDetails(out, apacheSyntax,
+		"/etc/apache2/sites-enabled/*", "/etc/apache2/conf.d/*.conf",
+		"/etc/httpd/conf.d/*.conf", "/etc/httpd/conf/httpd.conf")
+	return out
+}
+
+func pairVhostDetails(out map[string]vhostDetail, syn vhostSyntax, globs ...string) {
 	for _, g := range globs {
 		files, err := filepath.Glob(g)
 		if err != nil {
@@ -196,36 +258,84 @@ func pairVhostRoots(out map[string]string, blockRe, nameRe, rootRe *regexp.Regex
 			if err != nil {
 				continue
 			}
-			var names []string
-			var root string
-			flush := func() {
-				if root == "" {
-					return
-				}
-				clean := strings.TrimRight(strings.Trim(strings.TrimSpace(root), `"'`), "/")
-				for _, n := range names {
-					if isResolvableDomain(n) {
-						if _, exists := out[n]; !exists {
-							out[n] = clean
-						}
-					}
-				}
-			}
-			for _, line := range strings.Split(string(data), "\n") {
-				if blockRe.MatchString(line) {
-					flush()
-					names, root = nil, ""
-				}
-				if m := nameRe.FindStringSubmatch(line); m != nil {
-					names = append(names, strings.Fields(m[1])...)
-				}
-				if m := rootRe.FindStringSubmatch(line); m != nil {
-					root = m[1]
-				}
-			}
-			flush()
+			parseVhostDetails(out, syn, string(data))
 		}
 	}
+}
+
+// parseVhostDetails is the pure part of pairVhostDetails (config text in,
+// per-domain details out) so it can be tested without /etc.
+func parseVhostDetails(out map[string]vhostDetail, syn vhostSyntax, config string) {
+	var names []string
+	var cur vhostDetail
+	siteRootProxy := false
+	inLocationRoot := false
+	flush := func() {
+		if cur == (vhostDetail{}) {
+			return
+		}
+		for _, n := range names {
+			if !isResolvableDomain(n) {
+				continue
+			}
+			prev, exists := out[n]
+			if !exists {
+				out[n] = cur
+				continue
+			}
+			// The same name in several blocks (port 80 redirect + 443 site):
+			// fill in whatever the earlier block left empty.
+			if prev.Root == "" {
+				prev.Root = cur.Root
+			}
+			if prev.Upstream == "" {
+				prev.Upstream = cur.Upstream
+			}
+			if prev.AppRoot == "" {
+				prev.AppRoot = cur.AppRoot
+			}
+			out[n] = prev
+		}
+	}
+	for _, line := range strings.Split(config, "\n") {
+		if syn.block.MatchString(line) {
+			flush()
+			names, cur, siteRootProxy, inLocationRoot = nil, vhostDetail{}, false, false
+		}
+		if nginxLocationRe.MatchString(line) {
+			inLocationRoot = nginxLocationRoot.MatchString(line)
+		}
+		if m := syn.name.FindStringSubmatch(line); m != nil {
+			names = append(names, strings.Fields(m[1])...)
+		}
+		if m := syn.root.FindStringSubmatch(line); m != nil {
+			cur.Root = cleanConfigPath(m[1])
+		}
+		if m := syn.appRoot.FindStringSubmatch(line); m != nil {
+			cur.AppRoot = cleanConfigPath(m[1])
+		}
+		if target, isSiteRoot, ok := syn.proxy(line); ok {
+			isSiteRoot = isSiteRoot || inLocationRoot
+			// The proxy for "/" wins over one for a sub-path (/api, /ws).
+			if cur.Upstream == "" || (isSiteRoot && !siteRootProxy) {
+				cur.Upstream = cleanUpstream(target)
+				siteRootProxy = isSiteRoot
+			}
+		}
+	}
+	flush()
+}
+
+func cleanConfigPath(v string) string {
+	return strings.TrimRight(strings.Trim(strings.TrimSpace(v), `"'`), "/")
+}
+
+// cleanUpstream trims quotes and drops any user:password@ from a proxy URL —
+// the agent never ships credentials.
+func cleanUpstream(v string) string {
+	v = strings.Trim(strings.TrimSpace(v), `"'`)
+	v = urlUserinfoRe.ReplaceAllString(v, "$1")
+	return strings.TrimRight(v, "/")
 }
 
 // isResolvableDomain filters out placeholders and wildcards that cannot be

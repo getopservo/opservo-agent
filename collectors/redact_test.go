@@ -61,3 +61,48 @@ func TestRedactEntriesBeforeHash(t *testing.T) {
 		t.Fatalf("got %q", e[0].Message)
 	}
 }
+
+// Crontabs and process command lines are shipped as raw text, so the secrets
+// people type inline there must be gone before the snapshot leaves the box.
+func TestRedactLines_CrontabAndCmdline(t *testing.T) {
+	cron := "# user: deploy\n" +
+		"0 3 * * * mysqldump -uroot -pS3cret shop > /backup/shop.sql\n" +
+		"15 3 * * * AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY aws s3 sync /backup s3://b\n"
+	got := redactLines(cron)
+	for _, leak := range []string{"S3cret", "wJalrXUtnFEMI"} {
+		if strings.Contains(got, leak) {
+			t.Errorf("crontab still contains %q:\n%s", leak, got)
+		}
+	}
+	if !strings.Contains(got, "-p[redacted] shop") || !strings.Contains(got, "AWS_SECRET_ACCESS_KEY=[redacted] aws") {
+		t.Errorf("unexpected masking:\n%s", got)
+	}
+	if !strings.HasPrefix(got, "# user: deploy\n") {
+		t.Errorf("harmless header changed:\n%s", got)
+	}
+	if got := RedactSecrets("mysql -uapp -pHunter2 -h db shop"); got != "mysql -uapp -p[redacted] -h db shop" {
+		t.Errorf("cmdline: %q", got)
+	}
+}
+
+func TestMaskWhoLine(t *testing.T) {
+	cases := map[string]string{
+		"shanky   pts/0        2026-10-15 10:02 (203.0.113.7)":         "sh**** pts/0 2026-10-15 10:02 (203.0.*.*)",
+		"root     tty1         2026-10-14 08:00":                       "ro** tty1 2026-10-14 08:00",
+		"deploy   pts/1        2026-10-15 09:30 (2001:db8:1234::5)":    "de**** pts/1 2026-10-15 09:30 (2001:db8:*)",
+		"jane     pts/2        2026-10-15 11:00 (bastion.example.com)": "ja** pts/2 2026-10-15 11:00 (bastion.example.com)",
+		"":    "",
+		"   ": "",
+	}
+	for in, want := range cases {
+		if got := maskWhoLine(in); got != want {
+			t.Errorf("maskWhoLine(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := maskKeyComment("jane.doe@MacBook"); got != "ja******@MacBook" {
+		t.Errorf("maskKeyComment = %q", got)
+	}
+	if got := maskKeyComment("deploy-ci"); got != "de*******" {
+		t.Errorf("maskKeyComment = %q", got)
+	}
+}

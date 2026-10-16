@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ContainerStat is one container's live resource usage (from `docker stats`).
@@ -14,6 +15,21 @@ type ContainerStat struct {
 	MemPercent float64 `json:"mem_percent"`
 	NetRxBytes int64   `json:"net_rx_bytes"` // cumulative
 	NetTxBytes int64   `json:"net_tx_bytes"`
+
+	// From `docker ps` (agents from Oct 2026): what the container is and how
+	// it is reached, so the dashboard can say which container serves a site.
+	Image   string          `json:"image,omitempty"`
+	Project string          `json:"project,omitempty"` // docker compose project
+	Status  string          `json:"status,omitempty"`  // e.g. "Up 4 weeks", "Restarting (1) 12 seconds ago"
+	Ports   []PublishedPort `json:"ports,omitempty"`   // host ports published to the container
+}
+
+// PublishedPort is one host port Docker forwards into a container.
+type PublishedPort struct {
+	HostIP        string `json:"host_ip,omitempty"`
+	HostPort      int    `json:"host_port"`
+	ContainerPort int    `json:"container_port"`
+	Protocol      string `json:"protocol"`
 }
 
 // ContainersInfo: per-container resource usage. App/container-level observability
@@ -42,7 +58,76 @@ func (c *ContainersCollector) Collect(ctx context.Context) (interface{}, error) 
 	}
 	info.Available = true
 	info.Containers = parseDockerStats(string(out))
+	if ps, err := cachedCmd(ctx, 30*time.Second, 8*time.Second, "docker", "ps", "--no-trunc",
+		"--format", `{{.Names}}\t{{.Image}}\t{{.Label "com.docker.compose.project"}}\t{{.Status}}\t{{.Ports}}`); err == nil {
+		mergeDockerPS(info.Containers, string(ps))
+	}
 	return info, nil
+}
+
+// mergeDockerPS adds image / compose project / status / published ports from
+// `docker ps` rows (Name\tImage\tProject\tStatus\tPorts) onto the stats rows.
+// Pure + unit-tested.
+func mergeDockerPS(stats []ContainerStat, out string) {
+	byName := map[string]*ContainerStat{}
+	for i := range stats {
+		byName[stats[i].Name] = &stats[i]
+	}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Split(line, "\t")
+		if len(f) < 5 {
+			continue
+		}
+		c := byName[strings.TrimSpace(f[0])]
+		if c == nil {
+			continue
+		}
+		c.Image = RedactSecrets(strings.TrimSpace(f[1])) // registry URLs can carry user:pass@
+		c.Project = strings.TrimSpace(f[2])
+		c.Status = strings.TrimSpace(f[3])
+		c.Ports = parseDockerPorts(f[4])
+	}
+}
+
+// parseDockerPorts parses the Ports column of `docker ps`, e.g.
+// "0.0.0.0:8080->80/tcp, :::8080->80/tcp, 5432/tcp", keeping only ports
+// published on the host (one entry per host port + protocol).
+func parseDockerPorts(s string) []PublishedPort {
+	var out []PublishedPort
+	seen := map[string]bool{}
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		arrow := strings.Index(part, "->")
+		if arrow < 0 {
+			continue // exposed but not published
+		}
+		host, target := part[:arrow], part[arrow+2:]
+		colon := strings.LastIndex(host, ":")
+		if colon < 0 {
+			continue
+		}
+		hostIP, hostPortS := host[:colon], host[colon+1:]
+		proto := "tcp"
+		if slash := strings.Index(target, "/"); slash >= 0 {
+			proto = target[slash+1:]
+			target = target[:slash]
+		}
+		hostPort, err1 := strconv.Atoi(strings.SplitN(hostPortS, "-", 2)[0])
+		ctrPort, err2 := strconv.Atoi(strings.SplitN(target, "-", 2)[0])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		key := hostPortS + "/" + proto
+		if seen[key] {
+			continue // same port on IPv4 and IPv6
+		}
+		seen[key] = true
+		if hostIP == "::" || hostIP == "[::]" {
+			hostIP = "0.0.0.0"
+		}
+		out = append(out, PublishedPort{HostIP: hostIP, HostPort: hostPort, ContainerPort: ctrPort, Protocol: proto})
+	}
+	return out
 }
 
 // parseDockerStats parses `docker stats --format` tab-separated output. Pure +

@@ -591,7 +591,7 @@ func suspiciousProcesses(ctx context.Context) []SuspiciousProcess {
 		out = append(out, SuspiciousProcess{
 			PID:     p.Pid,
 			Name:    name,
-			Cmdline: truncate(cmdline),
+			Cmdline: truncate(RedactSecrets(cmdline)),
 			Reason:  reason,
 		})
 	}
@@ -745,4 +745,11 @@ func runCmdTimeout(ctx context.Context, timeout time.Duration, name string, args
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	return runCmd(cctx, name, args...)
+}
+
+// runCmdEnvTimeout is runCmdTimeout with extra child-only environment variables.
+func runCmdEnvTimeout(ctx context.Context, timeout time.Duration, env []string, name string, args ...string) ([]byte, error) {
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return runCmdEnv(cctx, env, name, args...)
 }

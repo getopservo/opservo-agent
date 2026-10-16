@@ -4,16 +4,17 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/getopservo/opservo-agent/collectors"
+	"github.com/getopservo/opservo-agent/reqsign"
 	"github.com/getopservo/opservo-agent/shell"
 )
 
@@ -28,7 +29,12 @@ import (
 // Mirrors the update-manifest signing convention in updater/updater.go (signingPublicKeyHex) — same rollout shape, a
 // DIFFERENT dedicated keypair (this one must be usable by a live process, so
 // it can't be the build-only update-signing key).
-const commandSigningPublicKeyHex = "e1a4093b146bf6f33492aba76692362111b6abadeb8d46f90cd891fa9c4e1c7a"
+//
+// A var so another environment's build can link in its own key
+// (-ldflags "-X github.com/getopservo/opservo-agent/executor.commandSigningPublicKeyHex=…",
+// set from api/Dockerfile's COMMAND_SIGNING_PUBKEY build arg). Keep
+// prober.probeSigningPublicKeyHex in step — the API signs both with one keypair.
+var commandSigningPublicKeyHex = "e1a4093b146bf6f33492aba76692362111b6abadeb8d46f90cd891fa9c4e1c7a"
 
 // Executor polls the Opservo API for pending commands and runs them. It is
 // started unless the operator hard-disables it locally
@@ -96,6 +102,22 @@ func verifyCommandSignature(pubKeyHex, agentID string, c pendingCommand) error {
 	msg := c.ID + "\n" + agentID + "\n" + c.Command + "\n" + c.ExpiresAt
 	if !ed25519.Verify(ed25519.PublicKey(pub), []byte(msg), sig) {
 		return fmt.Errorf("signature verification failed")
+	}
+	return nil
+}
+
+// checkCommandExpiry refuses a command whose signed expires_at has passed.
+// The signature proves the API issued it, not that it is still wanted: a
+// captured poll response replayed later would otherwise run stale commands.
+// The API always sets expires_at (RFC 3339), so an empty or unparseable value
+// is treated as expired, not as "no deadline".
+func checkCommandExpiry(c pendingCommand, now time.Time) error {
+	exp, err := time.Parse(time.RFC3339Nano, c.ExpiresAt)
+	if err != nil {
+		return fmt.Errorf("command expired: bad expiry %q", c.ExpiresAt)
+	}
+	if !now.Before(exp) {
+		return fmt.Errorf("command expired at %s", c.ExpiresAt)
 	}
 	return nil
 }
@@ -191,6 +213,14 @@ func (e *Executor) poll(ctx context.Context) (hint time.Duration) {
 			}
 			continue
 		}
+		if err := checkCommandExpiry(c, time.Now()); err != nil {
+			slog.Error("REFUSING expired command — not executing", "command_id", c.ID, "error", err)
+			res := CommandResult{Status: "error", ExitCode: -1, Stderr: "rejected: " + err.Error()}
+			if serr := e.submitResult(ctx, c.ID, res); serr != nil {
+				slog.Warn("failed to submit command result", "command_id", c.ID, "error", serr)
+			}
+			continue
+		}
 		if touchesAgentSwitches(c.Command) {
 			slog.Error("REFUSING command that touches the agent's own switches — not executing", "command_id", c.ID)
 			res := CommandResult{Status: "error", ExitCode: -1, Stderr: selfProtectMessage}
@@ -199,7 +229,7 @@ func (e *Executor) poll(ctx context.Context) (hint time.Duration) {
 			}
 			continue
 		}
-		slog.Warn("executing dispatched command", "command_id", c.ID, "command", c.Command, "has_secrets", len(c.Env) > 0)
+		slog.Warn("executing dispatched command", "command_id", c.ID, "command", logCommand(c.Command), "has_secrets", len(c.Env) > 0)
 		id := c.ID
 		res := runCommandWithProgress(ctx, c.Command, c.Env, time.Duration(c.TimeoutSeconds)*time.Second, progressEvery, func(stdout, stderr string) bool {
 			cancelSig, perr := e.submitProgress(ctx, id, stdout, stderr)
@@ -302,13 +332,36 @@ func (e *Executor) signedPost(ctx context.Context, path string, body []byte) (*h
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Agent-ID", e.agentID)
-	req.Header.Set("X-Signature", sign(body, e.secretKey))
-	req.Header.Set("X-Timestamp", time.Now().UTC().Format(time.RFC3339))
-	return e.client.Do(req)
+	// v2 HMAC: timestamp + nonce bound into the signature (reqsign).
+	reqsign.Apply(req.Header, e.secretKey, body)
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		// A 401 for clock skew is fixable with NTP; say so (throttled) and
+		// hand the response back untouched for the caller's normal handling.
+		// The body is small; re-wrap it so the caller can still read it.
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		reqsign.WarnClockSkew(resp.StatusCode, errBody, path)
+		resp.Body = io.NopCloser(bytes.NewReader(errBody))
+	}
+	return resp, nil
 }
 
-func sign(body []byte, secret string) string {
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write(body)
-	return hex.EncodeToString(mac.Sum(nil))
+// logCommandMax is how much of a dispatched command's text reaches the journal.
+const logCommandMax = 120
+
+// logCommand is the form of a command that is safe to log: secrets masked
+// (RedactSecrets, the same masker the log shipper uses) and truncated to
+// logCommandMax runes, so a long heredoc or an inline credential never lands
+// in journald, which every local admin can read. The full text is in
+// agent_commands on the API, where it is audited and access-controlled.
+func logCommand(cmd string) string {
+	cmd = collectors.RedactSecrets(cmd)
+	if r := []rune(cmd); len(r) > logCommandMax {
+		return string(r[:logCommandMax]) + "…"
+	}
+	return cmd
 }

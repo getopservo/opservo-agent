@@ -21,8 +21,10 @@ import (
 
 const (
 	maxLinesPerSource = 200
-	maxMessageLen     = 500
-	maxLogsBytes      = 100 * 1024 // keep the logs array under 100KB
+	// maxTailBytes bounds how far back one read of a file goes (readNewLines).
+	maxTailBytes  = 1 << 20
+	maxMessageLen = 500
+	maxLogsBytes  = 100 * 1024 // keep the logs array under 100KB
 )
 
 // LogEntry is one normalized log line shipped to the API.
@@ -53,7 +55,7 @@ func (c *LogsCollector) Collect(ctx context.Context) (interface{}, error) {
 	entries = append(entries, c.safe("nginx", func() []LogEntry { return c.collectNginx() })...)
 	entries = append(entries, c.safe("apache", func() []LogEntry { return c.collectApache() })...)
 	entries = append(entries, c.safe("laravel", func() []LogEntry { return c.collectLaravel() })...)
-	entries = append(entries, c.safe("pm2", func() []LogEntry { return c.collectPM2Logs() })...)
+	entries = append(entries, c.safe("pm2", func() []LogEntry { return c.collectPM2Logs(ctx) })...)
 	redactEntries(entries)
 
 	// Command-based sources — no file offset, so dedup by content hash.
@@ -158,11 +160,23 @@ func (c *LogsCollector) readNewLines(path string) []string {
 	var offset, prevSize int64
 	if c.buf != nil {
 		offset, prevSize, _ = c.buf.Cursor(path)
-	} else if size > 64*1024 {
-		offset = size - 64*1024 // no buffer: only tail recent bytes
 	}
 	if size < prevSize || offset > size {
 		offset = 0 // rotated or truncated
+	}
+	// Never read more than a bounded window in one pass. With no cursor yet
+	// (first heartbeat after install, or a rotated file) this used to walk a
+	// multi-GB access log from byte 0 and hold every line in memory before
+	// trimming to maxLinesPerSource. Only the newest lines ship anyway, so
+	// start inside the last maxTailBytes and skip the partial line we land in.
+	window := int64(maxTailBytes)
+	if c.buf == nil {
+		window = 64 * 1024 // no buffer: only tail recent bytes
+	}
+	skipPartial := false
+	if size-offset > window {
+		offset = size - window
+		skipPartial = true
 	}
 
 	f, err := os.Open(path)
@@ -173,15 +187,25 @@ func (c *LogsCollector) readNewLines(path string) []string {
 	if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
 			offset = 0
+			skipPartial = false
 		}
 	}
 
 	var lines []string
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		if line := scanner.Text(); strings.TrimSpace(line) != "" {
-			lines = append(lines, line)
+	rd := bufio.NewReaderSize(f, 64*1024)
+	complete := true
+	if skipPartial {
+		if _, err := rd.ReadString('\n'); err != nil {
+			complete = false // no newline in the window: nothing complete to ship
+		}
+	}
+	if complete {
+		scanner := bufio.NewScanner(rd)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			if line := scanner.Text(); strings.TrimSpace(line) != "" {
+				lines = append(lines, line)
+			}
 		}
 	}
 	if c.buf != nil {
@@ -270,22 +294,16 @@ func logFilesMatching(patterns ...string) []string {
 	return files
 }
 
-func (c *LogsCollector) collectPM2Logs() []LogEntry {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil
-	}
-	matches, _ := filepath.Glob(filepath.Join(home, ".pm2", "logs", "*.error.log"))
+func (c *LogsCollector) collectPM2Logs(ctx context.Context) []LogEntry {
 	var out []LogEntry
-	for _, path := range matches {
-		name := strings.TrimSuffix(filepath.Base(path), ".error.log")
-		for _, line := range c.readNewLines(path) {
+	for _, f := range pm2ErrorLogFiles(ctx) {
+		for _, line := range c.readNewLines(f.Path) {
 			out = append(out, LogEntry{
 				Source:      "pm2",
 				Level:       "error", // these are the error logs
 				Message:     truncate(line),
-				Timestamp:   parseLeadingTime(line, fileMtime(path)),
-				ServiceName: name,
+				Timestamp:   parseLeadingTime(line, fileMtime(f.Path)),
+				ServiceName: f.App,
 			})
 		}
 	}

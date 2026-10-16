@@ -195,7 +195,9 @@ func main() {
 	// (the binary is a throwaway `go run` build there).
 	if *autoUpdate && !*devMode {
 		slog.Info("auto-update enabled", "interval", *updateInterval)
-		go updater.New(*apiURL, *updateInterval).Run(ctx)
+		// The buffer directory also keeps the newest accepted manifest
+		// timestamp (anti-rollback for the signed update manifest).
+		go updater.New(*apiURL, *updateInterval).WithStateDir(filepath.Dir(*bufferPath)).Run(ctx)
 	}
 
 	// Remote command polling — on unless hard-disabled locally; the API only
