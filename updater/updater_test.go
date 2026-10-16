@@ -1,9 +1,15 @@
 package updater
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 // The embedded key must be a real 32-byte Ed25519 public key so signing is
@@ -157,5 +163,68 @@ func TestUpdater_StatePersistsAndRefusesRollback(t *testing.T) {
 	}
 	if New("x", 0).stateDir != "" {
 		t.Fatal("anti-rollback must be off without a state dir")
+	}
+}
+
+// A slow but steady download must finish even when it takes far longer than
+// the stall timeout; only a download that stops sending bytes is abandoned.
+func TestDownloadTo_SlowLinkSucceedsStallFails(t *testing.T) {
+	old := downloadStallTimeout
+	downloadStallTimeout = 150 * time.Millisecond
+	defer func() { downloadStallTimeout = old }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fl := w.(http.Flusher)
+		if r.URL.Path == "/download/stall" {
+			_, _ = w.Write([]byte("x"))
+			fl.Flush()
+			select {
+			case <-r.Context().Done():
+			case <-time.After(5 * time.Second):
+			}
+			return
+		}
+		for i := 0; i < 12; i++ { // ~600 ms in total, 4x the stall timeout
+			_, _ = w.Write([]byte("chunk"))
+			fl.Flush()
+			time.Sleep(50 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+	dir := t.TempDir()
+
+	u := New(srv.URL, time.Hour)
+	u.asset = "slow"
+	if err := u.downloadTo(context.Background(), filepath.Join(dir, "slow")); err != nil {
+		t.Fatalf("slow, steady download should succeed: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dir, "slow")); len(b) != 60 {
+		t.Fatalf("expected 60 bytes, got %d", len(b))
+	}
+
+	u.asset = "stall"
+	start := time.Now()
+	if err := u.downloadTo(context.Background(), filepath.Join(dir, "stall")); err == nil {
+		t.Fatal("a stalled download must fail")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("stall was not detected promptly (%v)", time.Since(start))
+	}
+	if _, err := os.Stat(filepath.Join(dir, "stall")); !os.IsNotExist(err) {
+		t.Fatal("a failed download must not leave a partial file")
+	}
+}
+
+func TestOnce_CountsConsecutiveFailures(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	u := New(srv.URL, time.Hour)
+	for i := 1; i <= warnAfterFailures; i++ {
+		u.once(context.Background())
+		if u.failures != i {
+			t.Fatalf("after %d failed checks, failures = %d", i, u.failures)
+		}
 	}
 }

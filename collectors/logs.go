@@ -332,13 +332,12 @@ func (c *LogsCollector) collectDockerLogs(ctx context.Context) []LogEntry {
 	if !hasBinary("docker") {
 		return nil
 	}
-	out, err := runCmd(ctx, "docker", "ps", "--format", "{{.Names}}")
-	if err != nil {
-		return nil
-	}
 	var entries []LogEntry
-	for _, name := range strings.Fields(string(out)) {
-		logs, err := runCmd(ctx, "docker", "logs", "--tail", "200", "--since", "1h", "--timestamps", name)
+	for _, c := range listContainers(ctx) {
+		name := c.Name
+		// Capped: 200 lines of a container that logs 1 MB JSON lines would
+		// otherwise be ~200 MB held in memory every minute.
+		logs, err := runCmdTail(ctx, defaultCmdTimeout, maxDockerLogBytes, "docker", "logs", "--tail", "200", "--since", "1h", "--timestamps", name)
 		if err != nil {
 			continue
 		}
@@ -353,7 +352,7 @@ func (c *LogsCollector) collectDockerLogs(ctx context.Context) []LogEntry {
 			ts, msg := splitDockerTimestamp(line)
 			lines = append(lines, LogEntry{
 				Source:      "docker",
-				Level:       levelFromKeywords(msg),
+				Level:       dockerLineLevel(msg),
 				Message:     truncate(msg),
 				Timestamp:   ts,
 				ServiceName: name,
@@ -584,6 +583,101 @@ func normLevel(s string) string {
 	case "emerg", "alert", "crit", "critical", "error", "err", "fatal":
 		return "error"
 	case "warn", "warning":
+		return "warning"
+	default:
+		return "info"
+	}
+}
+
+// dockerLineLevel classifies one container log line. Structured (JSON) lines
+// are read by their level field; only unstructured lines fall back to keyword
+// matching. Before this, every JSON line was keyword-matched as a whole, so
+// pino's info-level `{"level":30,...,"req":{"url":"/api/v1/blog/errors"},
+// "msg":"incoming request"}` counted as an error because the URL contained
+// "error" — a critical "Recurring error in docker logs" on the staging box
+// (15 Oct 2026). Any JSON logger trips the same way on a URL, user agent or
+// field name containing error/fatal/panic/exception/warn.
+func dockerLineLevel(msg string) string {
+	if level, ok := jsonLineLevel(msg); ok {
+		return level
+	}
+	return levelFromKeywords(msg)
+}
+
+// jsonLevelKeys are the field names JSON loggers use for the level, in the
+// order we trust them: pino/bunyan/zerolog/logrus/structlog use "level",
+// Google Cloud / Python logging use "severity", some use "lvl"/"loglevel".
+var jsonLevelKeys = []string{"level", "severity", "lvl", "loglevel", "log.level"}
+
+// jsonMessageKeys are the fields keyword matching may look at when a JSON
+// line has no level field — never the whole object.
+var jsonMessageKeys = []string{"msg", "message", "err", "error", "stack"}
+
+// jsonLineLevel returns the level of a structured log line and true, or
+// ("", false) when the line is not a JSON object.
+func jsonLineLevel(line string) (string, bool) {
+	if len(line) == 0 || line[0] != '{' {
+		return "", false
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(line), &obj); err != nil || obj == nil {
+		return "", false
+	}
+	for _, k := range jsonLevelKeys {
+		v, ok := obj[k]
+		if !ok || v == nil {
+			continue
+		}
+		switch t := v.(type) {
+		case float64:
+			return numericLogLevel(t), true
+		case string:
+			if n, err := strconv.Atoi(strings.TrimSpace(t)); err == nil {
+				return numericLogLevel(float64(n)), true
+			}
+			if strings.TrimSpace(t) != "" {
+				return normLevel(strings.TrimSpace(t)), true
+			}
+		}
+	}
+	// No level field: match keywords against the message-like fields only.
+	var parts []string
+	for _, k := range jsonMessageKeys {
+		v, ok := obj[k]
+		if !ok || v == nil {
+			continue
+		}
+		switch t := v.(type) {
+		case string:
+			parts = append(parts, t)
+		default:
+			if b, err := json.Marshal(t); err == nil {
+				parts = append(parts, string(b))
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return "info", true
+	}
+	return levelFromKeywords(strings.Join(parts, " ")), true
+}
+
+// numericLogLevel maps pino/bunyan numeric levels (10 trace, 20 debug,
+// 30 info, 40 warn, 50 error, 60 fatal) and syslog-style 0–7 severities.
+func numericLogLevel(n float64) string {
+	switch {
+	case n >= 50:
+		return "error"
+	case n >= 40:
+		return "warning"
+	case n >= 10:
+		return "info"
+	}
+	// 0–7: syslog severity (0 emerg … 3 err, 4 warning, 5+ notice/info/debug).
+	switch {
+	case n <= 3:
+		return "error"
+	case n == 4:
 		return "warning"
 	default:
 		return "info"

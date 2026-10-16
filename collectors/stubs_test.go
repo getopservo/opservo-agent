@@ -32,9 +32,9 @@ func TestProbeHTTPStatuses(t *testing.T) {
 	port := portFromURL(t, srv.URL)
 
 	got := probeHTTPStatuses([]ListeningPort{
-		{Port: port, Protocol: "tcp"},
-		{Port: 3306, Protocol: "tcp"}, // MySQL — in nonHTTPPorts, must be skipped
-		{Port: port, Protocol: "udp"}, // non-tcp, must be skipped
+		{Port: port, Protocol: "tcp", Process: "node"},
+		{Port: 3306, Protocol: "tcp", Process: "node"}, // MySQL port — in nonHTTPPorts, must be skipped
+		{Port: port, Protocol: "udp", Process: "node"}, // non-tcp, must be skipped
 	})
 
 	if got[port] != http.StatusServiceUnavailable {
@@ -47,7 +47,7 @@ func TestProbeHTTPStatuses(t *testing.T) {
 
 // A port with nothing listening yields no entry (connection refused, not a hang).
 func TestProbeHTTPStatuses_deadPort(t *testing.T) {
-	got := probeHTTPStatuses([]ListeningPort{{Port: 9, Protocol: "tcp"}})
+	got := probeHTTPStatuses([]ListeningPort{{Port: 9, Protocol: "tcp", Process: "nginx"}})
 	if _, ok := got[9]; ok {
 		t.Errorf("dead port should have no status, got %v", got)
 	}
@@ -99,7 +99,7 @@ func TestRefreshHTTPStatusInBackground(t *testing.T) {
 		httpStatusMu.Unlock()
 	})
 
-	ports := []ListeningPort{{Port: port, Protocol: "tcp"}}
+	ports := []ListeningPort{{Port: port, Protocol: "tcp", Process: "nginx"}}
 	refreshHTTPStatusInBackground(ports)
 
 	// Poll for the background probe to land in the cache (bounded).
@@ -115,5 +115,27 @@ func TestRefreshHTTPStatusInBackground(t *testing.T) {
 	}
 	if got != http.StatusOK {
 		t.Errorf("background probe should have cached %d, got %d", http.StatusOK, got)
+	}
+}
+
+// Only web servers / app runtimes are sent the reachability GET; a daemon that
+// merely listens (cupsd, containerd, kubelet, a desktop app) never is.
+func TestProbeHTTPStatuses_onlyWebServers(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
+	defer srv.Close()
+	port := portFromURL(t, srv.URL)
+	for _, proc := range []string{"cupsd", "containerd", "kubelet", "etcd", "syncthing", "Discord", ""} {
+		if got := probeHTTPStatuses([]ListeningPort{{Port: port, Protocol: "tcp", Process: proc}}); len(got) != 0 {
+			t.Errorf("process %q must not be probed, got %v", proc, got)
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("non-web processes received %d requests", hits)
+	}
+	for _, proc := range []string{"nginx", "node", "next-server (v15.5.25)", "docker-proxy", "uvicorn", "php8.3", "Python3"} {
+		if !looksLikeWebServer(proc) {
+			t.Errorf("%q should be probed", proc)
+		}
 	}
 }

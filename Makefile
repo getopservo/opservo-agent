@@ -1,5 +1,7 @@
+# Binary name the API serves and the installer installs (kept for existing
+# installs). VERSION comes from git unless given: make build VERSION=1.2.3
 BINARY=infrapilot-agent
-VERSION=0.1.0
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 .PHONY: build build-all run test clean lint
 

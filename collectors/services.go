@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -129,12 +130,72 @@ func runCmd(ctx context.Context, name string, args ...string) ([]byte, error) {
 	return runCmdEnv(ctx, nil, name, args...)
 }
 
+// Output caps for commands whose size depends on what other software prints.
+const (
+	maxDockerLogBytes = 1 << 20 // per container, per heartbeat
+	maxWebLogBytes    = 4 << 20 // 8000 access-log lines ≈ 1.5 MB; leaves room
+)
+
+// tailBuffer keeps only the LAST max bytes written (the newest log lines),
+// so memory stays bounded whatever the child prints.
+type tailBuffer struct {
+	max       int
+	buf       []byte
+	truncated bool
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > 2*t.max { // trim in batches, not on every write
+		t.buf = append(t.buf[:0], t.buf[len(t.buf)-t.max:]...)
+		t.truncated = true
+	}
+	return n, nil
+}
+
+// Bytes returns at most max bytes; when output was cut, the leading partial
+// line is dropped so callers only ever see whole lines.
+func (t *tailBuffer) Bytes() []byte {
+	b := t.buf
+	if len(b) > t.max {
+		b = b[len(b)-t.max:]
+		t.truncated = true
+	}
+	if t.truncated {
+		if i := bytes.IndexByte(b, '\n'); i >= 0 {
+			b = b[i+1:]
+		}
+	}
+	return b
+}
+
+// runCmdTail is runCmdTimeout with stdout bounded to its last max bytes.
+func runCmdTail(ctx context.Context, timeout time.Duration, max int, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	tb := &tailBuffer{max: max}
+	if err := runCmdInto(ctx, nil, tb, name, args...); err != nil {
+		return nil, err
+	}
+	return tb.Bytes(), nil
+}
+
 // runCmdEnv is runCmd with extra environment variables for the child only
 // (e.g. libpq PG* connection settings, which must never appear in argv).
 // The command runs in its own process group and the WHOLE group is killed when
 // the context ends, so a child that outlives `sh -c` cannot keep the stdout
 // pipe open and block Wait; WaitDelay is the backstop for I/O copying.
 func runCmdEnv(ctx context.Context, extraEnv []string, name string, args ...string) ([]byte, error) {
+	var out bytes.Buffer
+	if err := runCmdInto(ctx, extraEnv, &out, name, args...); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+// runCmdInto runs a command like runCmdEnv but streams stdout into w.
+func runCmdInto(ctx context.Context, extraEnv []string, w io.Writer, name string, args ...string) error {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, defaultCmdTimeout)
@@ -152,12 +213,8 @@ func runCmdEnv(ctx context.Context, extraEnv []string, name string, args ...stri
 		return nil
 	}
 	cmd.WaitDelay = 2 * time.Second
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return nil, err
-	}
-	return out.Bytes(), nil
+	cmd.Stdout = w
+	return cmd.Run()
 }
 
 // ── systemd ────────────────────────────────────────────────────────────────

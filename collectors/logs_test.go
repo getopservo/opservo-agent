@@ -281,3 +281,42 @@ func TestReadNewLines_FirstTailIsBounded(t *testing.T) {
 		t.Fatalf("no-buffer first line partial: %q", got[0])
 	}
 }
+
+func TestDockerLineLevel(t *testing.T) {
+	const pinoInfo = `{"level":30,"time":1760532374970,"pid":1,"hostname":"api","reqId":"req-1","req":{"method":"GET","url":"/api/v1/blog/errors","host":"localhost:3001","remoteAddress":"127.0.0.1"},"msg":"incoming request"}`
+	cases := []struct {
+		name, line, want string
+	}{
+		// The staging-box false positive: info request log whose URL says "errors".
+		{"pino info with error in url", pinoInfo, "info"},
+		{"pino error", `{"level":50,"msg":"request failed","err":{"type":"Error","message":"boom"}}`, "error"},
+		{"pino fatal", `{"level":60,"msg":"out of memory"}`, "error"},
+		{"pino warn", `{"level":40,"msg":"slow query"}`, "warning"},
+		{"pino debug", `{"level":20,"msg":"error handler registered"}`, "info"},
+		{"level as numeric string", `{"level":"50","msg":"x"}`, "error"},
+		{"zerolog string level", `{"level":"error","message":"connect: refused"}`, "error"},
+		{"logrus warning", `{"level":"warning","msg":"retrying"}`, "warning"},
+		{"gcp severity", `{"severity":"ERROR","message":"handler crashed"}`, "error"},
+		{"gcp severity info with scary message", `{"severity":"INFO","message":"error page served"}`, "info"},
+		{"syslog numeric 3", `{"level":3,"msg":"disk"}`, "error"},
+		{"syslog numeric 6", `{"level":6,"msg":"ok"}`, "info"},
+		// No level field: only the message-like fields are keyword-matched.
+		{"no level, msg has error", `{"msg":"panic: nil deref","url":"/ok"}`, "error"},
+		{"no level, only url mentions error", `{"msg":"served","url":"/errors"}`, "info"},
+		{"no level, nested err object", `{"event":"x","err":{"message":"fatal: lost connection"}}`, "error"},
+		{"no level, nothing message-like", `{"event":"request","path":"/errors"}`, "info"},
+		// Unstructured lines keep the keyword heuristic.
+		{"plain text error", "2026/10/15 12:46:14 ERROR failed to bind :80", "error"},
+		{"plain text warn", "WARN: cache miss", "warning"},
+		{"plain text info", "listening on :3001", "info"},
+		{"broken json falls back to keywords", `{"level":30,"msg":"error`, "error"},
+		{"json array is not an object", `["error"]`, "error"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := dockerLineLevel(c.line); got != c.want {
+				t.Errorf("dockerLineLevel(%s) = %q, want %q", c.line, got, c.want)
+			}
+		})
+	}
+}

@@ -26,10 +26,13 @@ import (
 var version = "dev"
 
 var (
-	apiURL         = flag.String("api-url", getEnv("OPSERVO_API_URL", "INFRAPILOT_API_URL", "https://api.getopservo.com"), "Opservo API URL")
-	agentID        = flag.String("agent-id", getEnv("OPSERVO_AGENT_ID", "INFRAPILOT_AGENT_ID", ""), "Agent ID (assigned at registration)")
-	secretKey      = flag.String("secret-key", getEnv("OPSERVO_SECRET_KEY", "INFRAPILOT_SECRET_KEY", ""), "Agent secret key")
-	devMode        = flag.Bool("dev", false, "Development mode (verbose logging, skip TLS verify)")
+	apiURL  = flag.String("api-url", getEnv("OPSERVO_API_URL", "INFRAPILOT_API_URL", "https://api.getopservo.com"), "Opservo API URL")
+	agentID = flag.String("agent-id", getEnv("OPSERVO_AGENT_ID", "INFRAPILOT_AGENT_ID", ""), "Agent ID (assigned at registration)")
+	// Deprecated as a command-line flag: argv is visible to every user in `ps`.
+	// Still accepted (old hand-made units) with a warning; set
+	// OPSERVO_SECRET_KEY in the environment / config file instead.
+	secretKey      = flag.String("secret-key", getEnv("OPSERVO_SECRET_KEY", "INFRAPILOT_SECRET_KEY", ""), "Agent secret key (deprecated on the command line — visible in ps; use OPSERVO_SECRET_KEY)")
+	devMode        = flag.Bool("dev", false, "Development mode (verbose logging; skips TLS verify only for a loopback API URL)")
 	interval       = flag.Duration("interval", 60*time.Second, "Heartbeat interval")
 	autoUpdate     = flag.Bool("auto-update", getEnv("OPSERVO_AUTO_UPDATE", "INFRAPILOT_AUTO_UPDATE", "true") != "false", "Self-update the agent binary from the API")
 	updateInterval = flag.Duration("update-interval", time.Hour, "How often to check for agent updates")
@@ -80,6 +83,16 @@ func main() {
 		"interval", *interval,
 		"dev_mode", *devMode,
 	)
+	if flagSetOnCommandLine(flag.CommandLine, "secret-key") {
+		slog.Warn("--secret-key on the command line is visible to every user via ps; set OPSERVO_SECRET_KEY in " +
+			"the environment or the config file instead (the flag will be removed in a future release)")
+	}
+	// insecureTLS: --dev relaxes TLS verification (and may print the secret)
+	// ONLY against a loopback API. See devflags.go.
+	insecureTLS := *devMode && devTLSAllowed(*apiURL)
+	if *devMode && !insecureTLS {
+		slog.Warn("--dev against a non-loopback API: verbose logging only; TLS verification stays on")
+	}
 
 	// AMI-clone detection (see clonedetect.go). The installer records this
 	// box's identity; if the live identity differs, we're a clone booted from
@@ -92,7 +105,7 @@ func main() {
 		if enrollKey != "" {
 			slog.Info("Machine identity changed — this looks like an AMI/template clone; registering as a new server",
 				"recorded", recordedIdentity, "current", currentIdentity)
-			id, key, err := sender.Register(*apiURL, version, *devMode, enrollKey, currentIdentity)
+			id, key, err := sender.Register(*apiURL, version, insecureTLS, enrollKey, currentIdentity)
 			if err != nil {
 				// Exit → systemd restarts us in 5s; boot-time networking races resolve themselves.
 				slog.Error("Clone re-registration failed", "error", err)
@@ -117,7 +130,7 @@ func main() {
 	// If no agent ID, register first
 	if *agentID == "" || *secretKey == "" {
 		slog.Info("No agent credentials found — registering with API")
-		id, key, err := sender.Register(*apiURL, version, *devMode, enrollKey, currentIdentity)
+		id, key, err := sender.Register(*apiURL, version, insecureTLS, enrollKey, currentIdentity)
 		if err != nil {
 			slog.Error("Registration failed", "error", err)
 			os.Exit(1)
@@ -125,10 +138,10 @@ func main() {
 		*agentID = id
 		*secretKey = key
 		slog.Info("Registration successful", "agent_id", id)
-		// The secret key is only echoed in --dev mode: in production logs end up in
+		// The secret key is only echoed in --dev mode against a loopback API: in production logs end up in
 		// journald and log shippers. (The installer persists both values to
 		// /etc/infrapilot/config itself, so a normal install never relies on this.)
-		if *devMode {
+		if insecureTLS {
 			slog.Info("Add these to your environment to skip registration on restart",
 				"OPSERVO_AGENT_ID", id,
 				"OPSERVO_SECRET_KEY", key,
@@ -185,7 +198,7 @@ func main() {
 	})
 
 	// Build sender
-	s := sender.New(*apiURL, *agentID, *secretKey, *devMode)
+	s := sender.New(*apiURL, *agentID, *secretKey, insecureTLS)
 
 	// Run heartbeat loop
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -207,7 +220,7 @@ func main() {
 		if *enableShell {
 			slog.Warn("LIVE TERMINAL ENABLED — owners/admins can open a shell on this server from the dashboard when its terminal switch is on",
 				"agent_id", *agentID)
-			ex = ex.WithShell(shell.NewManager(*apiURL, *agentID, *secretKey, executor.CommandSigningPublicKeyHex(), *devMode))
+			ex = ex.WithShell(shell.NewManager(*apiURL, *agentID, *secretKey, executor.CommandSigningPublicKeyHex(), insecureTLS))
 		}
 		go ex.Run(ctx)
 	} else if *enableShell {

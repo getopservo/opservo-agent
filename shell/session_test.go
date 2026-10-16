@@ -47,9 +47,29 @@ func TestSession_EndToEnd(t *testing.T) {
 				_ = c.Write(ctx, websocket.MessageBinary, []byte(s))
 				time.Sleep(300 * time.Millisecond)
 			}
+			// Wait until the shell has printed `marker`: the next keystrokes
+			// must not be typeahead for a command that has not started yet.
+			// (On a loaded CI box a fixed sleep was not enough: the password
+			// arrived before `read -s` had turned echo off, 16 Oct 2026.)
+			waitFor := func(marker string) {
+				for i := 0; i < 100; i++ {
+					mu.Lock()
+					ok := strings.Contains(output.String(), marker)
+					mu.Unlock()
+					if ok {
+						return
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+			}
 			time.Sleep(500 * time.Millisecond)
 			send("echo hello-from-pty\r")
-			send("read -s PW\r") // a password prompt: echo off, line mode on
+			waitFor("hello-from-pty\r\n")
+			// A password prompt: echo off, line mode on. bash's read sets the
+			// terminal before printing the prompt, so once the prompt shows
+			// the secret is typed with echo off.
+			send("read -s -p 'PASSWORD: ' PW\r")
+			waitFor("PASSWORD: ")
 			send("my-secret-password\r")
 			send("echo len=${#PW}\r")
 			// A full-screen program in front reads a key in raw mode (like
@@ -57,15 +77,7 @@ func TestSession_EndToEnd(t *testing.T) {
 			// The key is sent only once that program prints READY, so it is
 			// never typeahead for the shell (which really would join the line).
 			send("stty raw -echo; bash -c 'echo RE\"\"ADY; head -c1 >/dev/null'; stty sane\r")
-			for i := 0; i < 50; i++ {
-				mu.Lock()
-				ready := strings.Contains(output.String(), "READY")
-				mu.Unlock()
-				if ready {
-					break
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
+			waitFor("READY")
 			send("q")
 			send("echo after-raw\r")
 			send("exit\r")
@@ -114,7 +126,7 @@ func TestSession_EndToEnd(t *testing.T) {
 		t.Errorf("dial was not HMAC-authenticated: agent=%q sig=%q", gotAgent, gotSig)
 	}
 	joined := strings.Join(lines, "|")
-	if !strings.Contains(joined, "echo hello-from-pty") || !strings.Contains(joined, "read -s PW") {
+	if !strings.Contains(joined, "echo hello-from-pty") || !strings.Contains(joined, "read -s -p 'PASSWORD: ' PW") {
 		t.Errorf("lines typed at the shell prompt not recorded: %q", lines)
 	}
 	if !strings.Contains(joined, "echo after-raw") || strings.Contains(joined, "qecho after-raw") {

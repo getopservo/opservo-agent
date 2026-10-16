@@ -123,34 +123,27 @@ func (w *WebMetricsCollector) Collect(ctx context.Context) (interface{}, error) 
 	// Containerized nginx/apache log access lines to the container's stdout, so
 	// they never appear under host /var/log. Read them via `docker logs`.
 	if hasBinary("docker") {
-		if out, err := runCmdTimeout(ctx, 4*time.Second, "docker", "ps", "--format", "{{.Names}}\t{{.Image}}"); err == nil {
-			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-				f := strings.SplitN(line, "\t", 2)
-				name := strings.TrimSpace(f[0])
-				image := ""
-				if len(f) > 1 {
-					image = f[1]
-				}
-				if name == "" || (!webContainerRe.MatchString(name) && !webContainerRe.MatchString(image)) {
-					continue
-				}
-				logs, err := runCmdTimeout(ctx, 6*time.Second, "docker", "logs", "--since", "6m", "--tail", "8000", name)
-				if err != nil || len(logs) == 0 {
-					continue
-				}
-				s := parseAccessWindow(string(logs), now, webWindowSeconds)
-				if s.Requests == 0 {
-					continue // a web-ish container with no parseable access logs (e.g. proxies)
-				}
-				info.Available = true
-				info.Sources++
-				info.Requests += s.Requests
-				info.Status2xx += s.S2xx
-				info.Status3xx += s.S3xx
-				info.Status4xx += s.S4xx
-				info.Status5xx += s.S5xx
-				info.BytesSent += s.Bytes
+		for _, c := range listContainers(ctx) {
+			name, image := c.Name, c.Image
+			if !webContainerRe.MatchString(name) && !webContainerRe.MatchString(image) {
+				continue
 			}
+			logs, err := runCmdTail(ctx, 6*time.Second, maxWebLogBytes, "docker", "logs", "--since", "6m", "--tail", "8000", name)
+			if err != nil || len(logs) == 0 {
+				continue
+			}
+			s := parseAccessWindow(string(logs), now, webWindowSeconds)
+			if s.Requests == 0 {
+				continue // a web-ish container with no parseable access logs (e.g. proxies)
+			}
+			info.Available = true
+			info.Sources++
+			info.Requests += s.Requests
+			info.Status2xx += s.S2xx
+			info.Status3xx += s.S3xx
+			info.Status4xx += s.S4xx
+			info.Status5xx += s.S5xx
+			info.BytesSent += s.Bytes
 		}
 	}
 

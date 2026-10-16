@@ -61,7 +61,6 @@ if [ -z "${DASHBOARD_URL}" ]; then
   DASHBOARD_URL="$(printf '%s' "${API_URL}" | sed -E 's#-api\.#.#; s#//api\.#//#')"
 fi
 VERSION="${OPSERVO_VERSION:-${INFRAPILOT_VERSION:-latest}}"
-REPO="${OPSERVO_REPO:-${INFRAPILOT_REPO:-getopservo/opservo-agent}}"
 TENANT_ID="${OPSERVO_TENANT_ID:-${INFRAPILOT_TENANT_ID:-}}"
 ENROLLMENT_TOKEN="${OPSERVO_TOKEN:-${INFRAPILOT_TOKEN:-}}"   # from the dashboard "Add New Server" flow
 FORCE="${OPSERVO_FORCE:-${INFRAPILOT_FORCE:-0}}"
@@ -664,8 +663,15 @@ Restart=always
 RestartSec=5
 # Persistent local buffer for the 24h offline store.
 StateDirectory=infrapilot
-# Modest hardening that does not interfere with read-only collection.
+# Hardening that does not interfere with collection OR with the opt-in remote
+# actions (dispatched fixes run as children of this unit, so anything that
+# would block sysctl/modprobe/cgroup/mount changes or hide /tmp is left off
+# on purpose — see docs/agent-hardening.md).
 NoNewPrivileges=true
+ProtectHostname=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target
@@ -688,6 +694,9 @@ has_intel_gpu() {
 }
 ensure_gpu_tools() {
   command -v intel_gpu_top >/dev/null 2>&1 && return 0
+  # Installing a package is a side effect some operators do not want from an
+  # agent installer: OPSERVO_INSTALL_GPU_TOOLS=0 skips it (GPU load reads "—").
+  [ "${OPSERVO_INSTALL_GPU_TOOLS:-1}" = "0" ] && return 0
   has_intel_gpu || return 0
   info "Intel GPU detected — installing intel-gpu-tools for GPU metrics (best effort)…"
   if command -v apt-get >/dev/null 2>&1; then

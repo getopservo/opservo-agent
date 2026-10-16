@@ -35,7 +35,19 @@ import (
 const (
 	defaultInterval = time.Hour
 	initialDelay    = 90 * time.Second // first check shortly after start
+	// Small requests (manifest, signature) get a plain deadline.
+	smallRequestTimeout = 60 * time.Second
+	// The binary download has no short wall-clock limit — an 11 MB file over a
+	// slow link (cheap VPS egress, a tunnel) can take minutes — only a stall
+	// watchdog (no bytes for downloadStallTimeout) and a generous ceiling.
+	downloadMaxDuration = 30 * time.Minute
+	// After this many consecutive failed checks the failure is logged at Warn
+	// (single misses stay at Debug: the API restarts during deploys).
+	warnAfterFailures = 3
 )
+
+// downloadStallTimeout is a var so tests can shorten it.
+var downloadStallTimeout = 60 * time.Second
 
 // signingPublicKeyHex is the Ed25519 public key (64 hex chars) used to verify the
 // update manifest's signature. It is set to Opservo's release key, so the
@@ -61,6 +73,7 @@ type Updater struct {
 	client   *http.Client
 	asset    string
 	stateDir string // where the last accepted manifest timestamp is kept ("" = no anti-rollback)
+	failures int    // consecutive failed checks (Run's goroutine only)
 }
 
 // manifestStateFile (inside stateDir) holds the `generated_at` of the newest
@@ -75,8 +88,10 @@ func New(apiURL string, interval time.Duration) *Updater {
 	return &Updater{
 		apiURL:   strings.TrimRight(apiURL, "/"),
 		interval: interval,
-		client:   &http.Client{Timeout: 90 * time.Second},
-		asset:    "infrapilot-agent-linux-" + runtime.GOARCH,
+		// No client-wide Timeout (it would cap the binary download); each
+		// request carries its own deadline or stall watchdog instead.
+		client: &http.Client{Transport: updaterTransport()},
+		asset:  "infrapilot-agent-linux-" + runtime.GOARCH,
 	}
 }
 
@@ -112,8 +127,39 @@ func (u *Updater) Run(ctx context.Context) {
 
 func (u *Updater) once(ctx context.Context) {
 	if err := u.checkAndUpdate(ctx); err != nil {
-		slog.Debug("auto-update check failed", "error", err)
+		u.failures++
+		if u.failures >= warnAfterFailures {
+			slog.Warn("auto-update keeps failing — this server is not picking up new agent builds",
+				"consecutive_failures", u.failures, "error", err)
+		} else {
+			slog.Debug("auto-update check failed", "error", err)
+		}
+		return
 	}
+	u.failures = 0
+}
+
+// updaterTransport: the default transport plus a bound on waiting for
+// response headers, so a hung API can't hold a request open forever.
+func updaterTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = 30 * time.Second
+	return t
+}
+
+// stallReader cancels the request when no bytes have arrived for `stall`.
+type stallReader struct {
+	r     io.Reader
+	timer *time.Timer
+	stall time.Duration
+}
+
+func (s *stallReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if n > 0 {
+		s.timer.Reset(s.stall)
+	}
+	return n, err
 }
 
 // NeedsUpdate reports the wanted sha and whether the running binary differs from
@@ -281,6 +327,8 @@ func verifyManifestSignature(pubKeyHex string, manifest []byte, sigHex string) e
 }
 
 func (u *Updater) fetchBytes(ctx context.Context, path string, limit int64) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, smallRequestTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.apiURL+path, nil)
 	if err != nil {
 		return nil, err
@@ -297,6 +345,10 @@ func (u *Updater) fetchBytes(ctx context.Context, path string, limit int64) ([]b
 }
 
 func (u *Updater) downloadTo(ctx context.Context, dst string) error {
+	ctx, cancel := context.WithTimeout(ctx, downloadMaxDuration)
+	defer cancel()
+	stalled := time.AfterFunc(downloadStallTimeout, cancel)
+	defer stalled.Stop()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.apiURL+"/download/"+u.asset, nil)
 	if err != nil {
 		return err
@@ -313,7 +365,7 @@ func (u *Updater) downloadTo(ctx context.Context, dst string) error {
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(f, resp.Body)
+	_, copyErr := io.Copy(f, &stallReader{r: resp.Body, timer: stalled, stall: downloadStallTimeout})
 	closeErr := f.Close()
 	if copyErr != nil {
 		os.Remove(dst)

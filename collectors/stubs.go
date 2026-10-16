@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -154,6 +155,34 @@ var nonHTTPPorts = map[uint32]bool{
 	11211: true, 27017: true,
 }
 
+// webServerPrefixes: owning processes we send the reachability GET to — web
+// servers, proxies and app runtimes (lowercased name prefixes). Anything else
+// (cupsd, containerd, kubelet, etcd, syncthing, desktop apps, custom daemons)
+// is never sent an unsolicited request: a GET from root once a minute can
+// count as a hit, trip an auth log, or be trusted because it comes from
+// loopback. docker-proxy covers published container ports.
+var webServerPrefixes = []string{
+	"nginx", "openresty", "apache2", "httpd", "lighttpd", "caddy", "traefik", "haproxy", "envoy",
+	"docker-proxy", "node", "next-server", "bun", "deno", "vite", "npm", "pnpm", "yarn",
+	"python", "uvicorn", "gunicorn", "hypercorn", "daphne", "uwsgi", "waitress", "streamlit",
+	"php", "java", "tomcat", "ruby", "puma", "unicorn", "rails", "dotnet", "beam.smp",
+}
+
+// looksLikeWebServer reports whether a listening port's owning process is one
+// we may probe over HTTP.
+func looksLikeWebServer(process string) bool {
+	p := strings.ToLower(strings.TrimSpace(process))
+	if p == "" {
+		return false
+	}
+	for _, w := range webServerPrefixes {
+		if strings.HasPrefix(p, w) {
+			return true
+		}
+	}
+	return false
+}
+
 // probeHTTPStatuses best-effort GETs each plausibly-HTTP listening port on
 // loopback and returns port→response-status, so the dashboard can tell a server
 // that is actually serving (200/3xx) from one that is listening but broken
@@ -175,7 +204,7 @@ func probeHTTPStatuses(ports []ListeningPort) map[uint32]int {
 	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
 	for i := range ports {
-		if ports[i].Protocol != "tcp" || nonHTTPPorts[ports[i].Port] {
+		if ports[i].Protocol != "tcp" || nonHTTPPorts[ports[i].Port] || !looksLikeWebServer(ports[i].Process) {
 			continue
 		}
 		wg.Add(1)

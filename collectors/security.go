@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -573,25 +574,49 @@ func iptablesHasFiltering(out string) bool {
 
 // ── Suspicious processes ──────────────────────────────────────────────────────
 
+// procFacts is what suspicionReason needs about one process. Collected by
+// suspiciousProcesses; built by hand in tests.
+type procFacts struct {
+	PID     int32
+	Name    string
+	Exe     string
+	Cmdline string
+	// ParentExe is the parent's resolved executable (readlink /proc/<ppid>/exe),
+	// "" when the parent is gone or unreadable. ParentCmdline likewise.
+	ParentExe     string
+	ParentCmdline string
+	// Age is how long the process has been running (0 when unknown).
+	Age time.Duration
+}
+
 func suspiciousProcesses(ctx context.Context) []SuspiciousProcess {
 	procs, err := process.ProcessesWithContext(ctx)
 	if err != nil {
 		return nil
 	}
+	now := time.Now()
 	var out []SuspiciousProcess
 	for _, p := range procs {
-		name, _ := p.NameWithContext(ctx)
-		cmdline, _ := p.CmdlineWithContext(ctx)
-		exe, _ := p.ExeWithContext(ctx)
+		f := procFacts{PID: p.Pid}
+		f.Name, _ = p.NameWithContext(ctx)
+		f.Cmdline, _ = p.CmdlineWithContext(ctx)
+		f.Exe, _ = p.ExeWithContext(ctx)
+		if parent, err := p.ParentWithContext(ctx); err == nil && parent != nil {
+			f.ParentExe, _ = parent.ExeWithContext(ctx)
+			f.ParentCmdline, _ = parent.CmdlineWithContext(ctx)
+		}
+		if ms, err := p.CreateTimeWithContext(ctx); err == nil && ms > 0 {
+			f.Age = now.Sub(time.UnixMilli(ms))
+		}
 
-		reason := suspicionReason(p.Pid, name, exe, cmdline)
+		reason := suspicionReason(f)
 		if reason == "" {
 			continue
 		}
 		out = append(out, SuspiciousProcess{
-			PID:     p.Pid,
-			Name:    name,
-			Cmdline: truncate(RedactSecrets(cmdline)),
+			PID:     f.PID,
+			Name:    f.Name,
+			Cmdline: truncate(RedactSecrets(f.Cmdline)),
 			Reason:  reason,
 		})
 	}
@@ -600,19 +625,22 @@ func suspiciousProcesses(ctx context.Context) []SuspiciousProcess {
 
 // suspicionReason returns a non-empty reason if a process matches a known-bad
 // pattern, or "" if it looks benign.
-func suspicionReason(pid int32, name, exe, cmdline string) string {
-	lname := strings.ToLower(name)
+func suspicionReason(f procFacts) string {
+	lname := strings.ToLower(f.Name)
 	if knownMalwareNames[lname] {
-		return "process name matches known cryptominer/malware: " + name
+		return "process name matches known cryptominer/malware: " + f.Name
 	}
 	// kthreadd is a genuine kernel thread that is always PID 2; any other PID
 	// using that name is masquerading.
-	if lname == "kthreadd" && pid != 2 {
+	if lname == "kthreadd" && f.PID != 2 {
 		return "process masquerading as the kernel thread kthreadd"
 	}
 	// Executables launched from /tmp (or a .tmp binary) are a classic dropper
 	// indicator.
-	if runsFromTmp(exe) || runsFromTmp(firstField(cmdline)) {
+	if runsFromTmp(f.Exe) || runsFromTmp(firstField(f.Cmdline)) {
+		if isGoToolchainChild(f) {
+			return ""
+		}
 		return "executable is running from /tmp"
 	}
 	return ""
@@ -623,6 +651,93 @@ func runsFromTmp(path string) bool {
 		return false
 	}
 	return strings.HasPrefix(path, "/tmp/") || strings.HasSuffix(path, ".tmp")
+}
+
+// goToolchainWorkFile matches the binaries the Go toolchain itself writes into
+// its per-invocation work directory: `/tmp/go-build<digits>/b<digits>/<pkg>.test`
+// for `go test`, and `/tmp/go-build<digits>/b<digits>/exe/<name>` for `go run`.
+var goToolchainWorkFile = regexp.MustCompile(`^/tmp/go-build[0-9]+/b[0-9]+/(exe/[^/]+|[^/]+\.test)$`)
+
+// goToolchainMaxAge bounds the exemption: test binaries and `go run` scripts
+// finish in seconds or minutes, so anything that has used the shape for longer
+// (a miner started with `go run miner.go`) is flagged after all.
+const goToolchainMaxAge = 30 * time.Minute
+
+// worldWritableDirs are places any local user can plant a binary called `go`.
+var worldWritableDirs = []string{"/tmp/", "/var/tmp/", "/dev/shm/"}
+
+// isGoToolchainChild reports whether a /tmp binary is one the Go toolchain
+// built and is itself running. A CI runner or developer running `go test ./...`
+// on a box used to raise a critical "running from /tmp" finding for every
+// package under test (staging box, 15 Oct 2026). All of these must hold:
+//
+//  1. the path has the exact go-build layout (anyone can mkdir
+//     /tmp/go-build1/b001, so the path alone proves nothing);
+//  2. the parent's resolved executable is a `go` binary that is not deleted
+//     and not under a world-writable directory. Not an allowlist of GOROOTs:
+//     actions/setup-go installs the real toolchain under the runner user's
+//     home, which is exactly the case this exempts;
+//  3. the parent was invoked as `go test` or `go run` (the only subcommands
+//     that execute a work-dir binary);
+//  4. the process is younger than goToolchainMaxAge.
+//
+// A parent that has exited (re-parented to PID 1 / a subreaper) or whose exe
+// is unreadable fails 2, so the process is flagged. The known-malware name
+// list is checked before this rule either way.
+//
+// Known limit: this is a text guard, not toolchain verification. It assumes
+// the attacker cannot write executables in the runner user's home — someone
+// who can drop ~/x/go, run "go run" from it and restart the payload every
+// 29 minutes passes all four checks. Closing that needs a hash/signature
+// check of the go binary itself; not worth it here, since that attacker
+// already has many other footholds.
+func isGoToolchainChild(f procFacts) bool {
+	if !goToolchainWorkFile.MatchString(f.Exe) {
+		return false
+	}
+	if !isTrustedGoBinary(f.ParentExe) {
+		return false
+	}
+	if sub := goSubcommand(f.ParentCmdline); sub != "test" && sub != "run" {
+		return false
+	}
+	if f.Age <= 0 || f.Age > goToolchainMaxAge {
+		return false
+	}
+	return true
+}
+
+func isTrustedGoBinary(exe string) bool {
+	if exe == "" || filepath.Base(exe) != "go" || !filepath.IsAbs(exe) {
+		return false
+	}
+	if strings.Contains(exe, "(deleted)") {
+		return false
+	}
+	for _, d := range worldWritableDirs {
+		if strings.HasPrefix(exe, d) {
+			return false
+		}
+	}
+	return true
+}
+
+// goSubcommand returns the `go` subcommand from a command line such as
+// "go test ./..." or "go -C agent run main.go", skipping the leading program
+// and the global -C <dir> flag; "" if none.
+func goSubcommand(cmdline string) string {
+	fields := strings.Fields(cmdline)
+	for i := 1; i < len(fields); i++ {
+		switch {
+		case fields[i] == "-C" && i+1 < len(fields):
+			i++
+		case strings.HasPrefix(fields[i], "-"):
+			continue
+		default:
+			return fields[i]
+		}
+	}
+	return ""
 }
 
 func firstField(s string) string {

@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -61,6 +62,12 @@ type Prober struct {
 	pubKey  string
 	mu      sync.Mutex
 	results []Result
+	// running is set while a probe run is in flight. A heartbeat that arrives
+	// meanwhile starts nothing, so an older, slower run can never overwrite
+	// the results of a newer one.
+	running atomic.Bool
+	// dial is runOne in production; tests swap it.
+	dial func(Check) Result
 }
 
 func New(agentID string) *Prober {
@@ -118,29 +125,57 @@ func runOne(c Check) Result {
 // results are stored and included in the NEXT heartbeat). An assignment with a
 // bad signature is never dialed; it reports an explicit rejection instead so
 // the tampering is visible on the dashboard rather than silently ignored.
-func (p *Prober) Run(checks []Check) {
+//
+// Single-flight: while a run is in progress a new one is skipped (returns
+// false). The checks are dialed concurrently, so a run takes about one dial
+// timeout (≤ 10 s) instead of up to 20 × 10 s — well inside the heartbeat
+// interval even when every target black-holes SYNs.
+func (p *Prober) Run(checks []Check) bool {
 	if len(checks) > maxChecks {
 		checks = checks[:maxChecks]
 	}
+	if !p.running.CompareAndSwap(false, true) {
+		slog.Debug("probe run still in progress; skipping this one")
+		return false
+	}
 	go func() {
-		results := make([]Result, 0, len(checks))
-		for _, c := range checks {
-			if c.Kind != "tcp" {
-				results = append(results, Result{ID: c.ID, Up: false, Error: "unsupported check kind: " + c.Kind})
-				continue
-			}
-			if err := verifySignature(p.pubKey, p.agentID, c); err != nil {
-				slog.Error("REFUSING unsigned/invalid probe assignment", "monitor_id", c.ID, "target", c.Target, "error", err)
-				results = append(results, Result{ID: c.ID, Up: false, Error: "rejected: " + err.Error()})
-				continue
-			}
-			slog.Debug("probing", "monitor_id", c.ID, "target", c.Target)
-			results = append(results, runOne(c))
-		}
+		defer p.running.Store(false)
+		results := p.runAll(checks)
 		p.mu.Lock()
 		p.results = results
 		p.mu.Unlock()
 	}()
+	return true
+}
+
+// runAll verifies and dials every check concurrently; results keep the
+// order of checks.
+func (p *Prober) runAll(checks []Check) []Result {
+	dial := p.dial
+	if dial == nil {
+		dial = runOne
+	}
+	results := make([]Result, len(checks))
+	var wg sync.WaitGroup
+	for i, c := range checks {
+		if c.Kind != "tcp" {
+			results[i] = Result{ID: c.ID, Up: false, Error: "unsupported check kind: " + c.Kind}
+			continue
+		}
+		if err := verifySignature(p.pubKey, p.agentID, c); err != nil {
+			slog.Error("REFUSING unsigned/invalid probe assignment", "monitor_id", c.ID, "target", c.Target, "error", err)
+			results[i] = Result{ID: c.ID, Up: false, Error: "rejected: " + err.Error()}
+			continue
+		}
+		slog.Debug("probing", "monitor_id", c.ID, "target", c.Target)
+		wg.Add(1)
+		go func(i int, c Check) {
+			defer wg.Done()
+			results[i] = dial(c)
+		}(i, c)
+	}
+	wg.Wait()
+	return results
 }
 
 // Drain returns the results collected since the last heartbeat and clears them.

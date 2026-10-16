@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/getopservo/opservo-agent/collectors"
@@ -49,7 +50,20 @@ type Executor struct {
 	// shell opens live terminal sessions delivered in the poll response; nil
 	// when OPSERVO_ENABLE_SHELL is off, and then any delivered start is ignored.
 	shell *shell.Manager
+	// Commands run one at a time, in order, on a worker goroutine fed by
+	// queue, so the poll loop keeps running while a long command (a 600 s apt
+	// upgrade) is in flight: live-terminal starts are opened at once instead
+	// of waiting behind it. inFlight counts queued + running commands; while
+	// it is > 0 the poll says `busy`, and the API leaves new commands pending
+	// (still stoppable from the dashboard) instead of handing them over to
+	// wait here. Old APIs ignore `busy` and the commands just queue locally.
+	queue    chan pendingCommand
+	inFlight atomic.Int32
 }
+
+// maxQueued bounds the local queue (an old API ignoring `busy` could hand
+// over more); a command that doesn't fit is refused, never silently dropped.
+const maxQueued = 64
 
 // WithShell turns on live terminal sessions for this executor.
 func (e *Executor) WithShell(m *shell.Manager) *Executor { e.shell = m; return e }
@@ -165,6 +179,8 @@ const minPollInterval = 500 * time.Millisecond
 func (e *Executor) Run(ctx context.Context) {
 	slog.Warn("REMOTE ACTIONS ENABLED — this server will execute commands dispatched from Opservo",
 		"agent_id", e.agentID, "poll_interval", e.interval)
+	e.queue = make(chan pendingCommand, maxQueued)
+	go e.worker(ctx)
 	timer := time.NewTimer(e.interval)
 	defer timer.Stop()
 	for {
@@ -192,7 +208,7 @@ func nextInterval(base, hint time.Duration) time.Duration {
 }
 
 func (e *Executor) poll(ctx context.Context) (hint time.Duration) {
-	cmds, shells, hint, err := e.fetchPending(ctx)
+	cmds, shells, hint, err := e.fetchPending(ctx, e.inFlight.Load() > 0)
 	if err != nil {
 		slog.Debug("command poll failed", "error", err)
 		return 0
@@ -205,62 +221,101 @@ func (e *Executor) poll(ctx context.Context) (hint time.Duration) {
 		e.shell.Open(ctx, s)
 	}
 	for _, c := range cmds {
-		if err := verifyCommandSignature(commandSigningPublicKeyHex, e.agentID, c); err != nil {
-			slog.Error("REFUSING unsigned/invalid command — not executing", "command_id", c.ID, "error", err)
-			res := CommandResult{Status: "error", ExitCode: -1, Stderr: "rejected: " + err.Error()}
-			if serr := e.submitResult(ctx, c.ID, res); serr != nil {
-				slog.Warn("failed to submit command result", "command_id", c.ID, "error", serr)
-			}
-			continue
-		}
-		if err := checkCommandExpiry(c, time.Now()); err != nil {
-			slog.Error("REFUSING expired command — not executing", "command_id", c.ID, "error", err)
-			res := CommandResult{Status: "error", ExitCode: -1, Stderr: "rejected: " + err.Error()}
-			if serr := e.submitResult(ctx, c.ID, res); serr != nil {
-				slog.Warn("failed to submit command result", "command_id", c.ID, "error", serr)
-			}
-			continue
-		}
-		if touchesAgentSwitches(c.Command) {
-			slog.Error("REFUSING command that touches the agent's own switches — not executing", "command_id", c.ID)
-			res := CommandResult{Status: "error", ExitCode: -1, Stderr: selfProtectMessage}
-			if serr := e.submitResult(ctx, c.ID, res); serr != nil {
-				slog.Warn("failed to submit command result", "command_id", c.ID, "error", serr)
-			}
-			continue
-		}
-		slog.Warn("executing dispatched command", "command_id", c.ID, "command", logCommand(c.Command), "has_secrets", len(c.Env) > 0)
-		id := c.ID
-		res := runCommandWithProgress(ctx, c.Command, c.Env, time.Duration(c.TimeoutSeconds)*time.Second, progressEvery, func(stdout, stderr string) bool {
-			cancelSig, perr := e.submitProgress(ctx, id, stdout, stderr)
-			if perr != nil {
-				slog.Debug("failed to submit command progress", "command_id", id, "error", perr)
-				return false
-			}
-			if cancelSig == nil {
-				return false
-			}
-			if err := verifyCancelSignature(commandSigningPublicKeyHex, e.agentID, id, *cancelSig); err != nil {
-				slog.Error("IGNORING stop request with a bad signature — command keeps running", "command_id", id, "error", err)
-				return false
-			}
-			slog.Warn("stopping command: stop requested from the dashboard", "command_id", id)
-			return true
-		})
-		slog.Warn("command finished", "command_id", c.ID, "status", res.Status, "exit_code", res.ExitCode)
-		if err := e.submitResult(ctx, c.ID, res); err != nil {
-			slog.Warn("failed to submit command result", "command_id", c.ID, "error", err)
-		}
+		e.enqueue(ctx, c)
 	}
 	return hint
+}
+
+// enqueue hands a command to the worker, or refuses it (with a result the
+// dashboard shows) when the local queue is full.
+func (e *Executor) enqueue(ctx context.Context, c pendingCommand) {
+	e.inFlight.Add(1)
+	select {
+	case e.queue <- c:
+	default:
+		e.inFlight.Add(-1)
+		slog.Error("command queue full — refusing command", "command_id", c.ID)
+		res := CommandResult{Status: "error", ExitCode: -1, Stderr: "rejected: this server is still running earlier commands; try again when they finish"}
+		if serr := e.submitResult(ctx, c.ID, res); serr != nil {
+			slog.Warn("failed to submit command result", "command_id", c.ID, "error", serr)
+		}
+	}
+}
+
+// worker runs queued commands one after another, in the order received.
+func (e *Executor) worker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case c := <-e.queue:
+			e.execute(ctx, c)
+			e.inFlight.Add(-1)
+		}
+	}
+}
+
+// execute verifies one command (signature, expiry, self-protection), runs it
+// with live progress + remote stop, and reports the result.
+func (e *Executor) execute(ctx context.Context, c pendingCommand) {
+	if err := verifyCommandSignature(commandSigningPublicKeyHex, e.agentID, c); err != nil {
+		slog.Error("REFUSING unsigned/invalid command — not executing", "command_id", c.ID, "error", err)
+		res := CommandResult{Status: "error", ExitCode: -1, Stderr: "rejected: " + err.Error()}
+		if serr := e.submitResult(ctx, c.ID, res); serr != nil {
+			slog.Warn("failed to submit command result", "command_id", c.ID, "error", serr)
+		}
+		return
+	}
+	if err := checkCommandExpiry(c, time.Now()); err != nil {
+		slog.Error("REFUSING expired command — not executing", "command_id", c.ID, "error", err)
+		res := CommandResult{Status: "error", ExitCode: -1, Stderr: "rejected: " + err.Error()}
+		if serr := e.submitResult(ctx, c.ID, res); serr != nil {
+			slog.Warn("failed to submit command result", "command_id", c.ID, "error", serr)
+		}
+		return
+	}
+	if touchesAgentSwitches(c.Command) {
+		slog.Error("REFUSING command that touches the agent's own switches — not executing", "command_id", c.ID)
+		res := CommandResult{Status: "error", ExitCode: -1, Stderr: selfProtectMessage}
+		if serr := e.submitResult(ctx, c.ID, res); serr != nil {
+			slog.Warn("failed to submit command result", "command_id", c.ID, "error", serr)
+		}
+		return
+	}
+	slog.Warn("executing dispatched command", "command_id", c.ID, "command", logCommand(c.Command), "has_secrets", len(c.Env) > 0)
+	id := c.ID
+	res := runCommandWithProgress(ctx, c.Command, c.Env, time.Duration(c.TimeoutSeconds)*time.Second, progressEvery, func(stdout, stderr string) bool {
+		cancelSig, perr := e.submitProgress(ctx, id, stdout, stderr)
+		if perr != nil {
+			slog.Debug("failed to submit command progress", "command_id", id, "error", perr)
+			return false
+		}
+		if cancelSig == nil {
+			return false
+		}
+		if err := verifyCancelSignature(commandSigningPublicKeyHex, e.agentID, id, *cancelSig); err != nil {
+			slog.Error("IGNORING stop request with a bad signature — command keeps running", "command_id", id, "error", err)
+			return false
+		}
+		slog.Warn("stopping command: stop requested from the dashboard", "command_id", id)
+		return true
+	})
+	slog.Warn("command finished", "command_id", c.ID, "status", res.Status, "exit_code", res.ExitCode)
+	if err := e.submitResult(ctx, c.ID, res); err != nil {
+		slog.Warn("failed to submit command result", "command_id", c.ID, "error", err)
+	}
 }
 
 // fetchPending asks the API for queued commands. The request body is HMAC-signed
 // with the agent secret (same scheme as heartbeats) so the API can authenticate
 // the agent, and marks the returned commands as dispatched server-side.
 // It also returns the API's poll-cadence hint (0 when absent).
-func (e *Executor) fetchPending(ctx context.Context) ([]pendingCommand, []shell.Start, time.Duration, error) {
-	body, _ := json.Marshal(map[string]string{"timestamp": time.Now().UTC().Format(time.RFC3339)})
+func (e *Executor) fetchPending(ctx context.Context, busy bool) ([]pendingCommand, []shell.Start, time.Duration, error) {
+	req := map[string]interface{}{"timestamp": time.Now().UTC().Format(time.RFC3339)}
+	if busy {
+		req["busy"] = true
+	}
+	body, _ := json.Marshal(req)
 	resp, err := e.signedPost(ctx, "/api/v1/agents/"+e.agentID+"/commands/poll", body)
 	if err != nil {
 		return nil, nil, 0, err

@@ -66,11 +66,14 @@ type containerRef struct {
 }
 
 // listContainers returns running containers, or nil when Docker is absent.
+// One `docker ps` per heartbeat is shared (cachedCmd) by every collector that
+// needs the list — the database collectors, web metrics and docker logs —
+// instead of each forking its own.
 func listContainers(ctx context.Context) []containerRef {
 	if !hasBinary("docker") {
 		return nil
 	}
-	out, err := runCmdTimeout(ctx, 4*time.Second, "docker", "ps", "--format", "{{.Names}}\t{{.Image}}")
+	out, err := cachedCmd(ctx, 30*time.Second, 4*time.Second, "docker", "ps", "--format", "{{.Names}}\t{{.Image}}")
 	if err != nil {
 		return nil
 	}

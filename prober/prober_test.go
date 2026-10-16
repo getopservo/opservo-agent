@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -113,5 +114,63 @@ func TestRunRejectsUnsignedWhenKeySet(t *testing.T) {
 	}
 	if results[0].Up || !strings.HasPrefix(results[0].Error, "rejected:") {
 		t.Fatalf("unsigned check should be rejected, got %+v", results[0])
+	}
+}
+
+func TestRunIsSingleFlightAndConcurrent(t *testing.T) {
+	release := make(chan struct{})
+	var inFlight, peak int32
+	var mu sync.Mutex
+	p := &Prober{agentID: "agent-1", dial: func(c Check) Result {
+		mu.Lock()
+		inFlight++
+		if inFlight > peak {
+			peak = inFlight
+		}
+		mu.Unlock()
+		<-release
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return Result{ID: c.ID, Up: true}
+	}}
+	checks := []Check{{ID: "m1", Kind: "tcp", Target: "a:1"}, {ID: "m2", Kind: "tcp", Target: "b:1"}, {ID: "m3", Kind: "udp", Target: "c:1"}}
+	if !p.Run(checks) {
+		t.Fatal("first run should start")
+	}
+	// A heartbeat arriving while the first run is still dialing starts nothing.
+	if p.Run([]Check{{ID: "late", Kind: "tcp", Target: "d:1"}}) {
+		t.Fatal("second run must be skipped while one is in flight")
+	}
+	// Both dials are in flight at once (concurrent, not one after the other).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := inFlight
+		mu.Unlock()
+		if n == 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(release)
+	var results []Result
+	for i := 0; i < 100; i++ {
+		if results = p.Drain(); len(results) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if peak != 2 {
+		t.Fatalf("expected 2 concurrent dials, peak was %d", peak)
+	}
+	if len(results) != 3 || results[0].ID != "m1" || results[1].ID != "m2" || results[2].ID != "m3" || results[2].Up {
+		t.Fatalf("results out of order or wrong: %+v", results)
+	}
+	for i := 0; i < 100 && p.running.Load(); i++ {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !p.Run(checks[:1]) {
+		t.Fatal("a new run should start once the previous one finished")
 	}
 }

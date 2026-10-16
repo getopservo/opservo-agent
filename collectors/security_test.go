@@ -1,6 +1,9 @@
 package collectors
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestSudoersFileHasUnscopedNopasswd(t *testing.T) {
 	tests := []struct {
@@ -164,29 +167,79 @@ func TestTopSources(t *testing.T) {
 }
 
 func TestSuspicionReason(t *testing.T) {
+	// actions/setup-go puts the real toolchain under the runner user's home.
+	const goTool = "/home/ci/actions-runner/_work/_tool/go/1.26.9/x64/bin/go"
+	const testBin = "/tmp/go-build436968702/b652/collectors.test"
+	const testCmd = testBin + " -test.testlogfile=/tmp/go-build436968702/b652/testlog.txt"
+	// goTest is a healthy `go test` child; mut tweaks one thing about it.
+	goTest := func(mut func(*procFacts)) procFacts {
+		pf := procFacts{PID: 96184, Name: "collectors.test", Exe: testBin, Cmdline: testCmd,
+			ParentExe: goTool, ParentCmdline: "go test ./...", Age: 20 * time.Second}
+		if mut != nil {
+			mut(&pf)
+		}
+		return pf
+	}
 	tests := []struct {
 		name        string
-		pid         int32
-		procName    string
-		exe         string
-		cmdline     string
+		f           procFacts
 		wantFlagged bool
 	}{
-		{"known miner by name", 1234, "xmrig", "/usr/bin/xmrig", "xmrig --donate 0", true},
-		{"kdevtmpfsi miner", 4321, "kdevtmpfsi", "", "", true},
-		{"fake kthreadd", 9999, "kthreadd", "", "", true},
-		{"real kthreadd at pid 2 is fine", 2, "kthreadd", "", "", false},
-		{"binary from /tmp", 555, "payload", "/tmp/payload", "/tmp/payload", true},
-		{"dot-tmp executable", 556, "x", "/opt/x.tmp", "/opt/x.tmp", true},
-		{"benign nginx", 100, "nginx", "/usr/sbin/nginx", "nginx: master process", false},
+		{"known miner by name", procFacts{PID: 1234, Name: "xmrig", Exe: "/usr/bin/xmrig", Cmdline: "xmrig --donate 0", ParentExe: "/bin/bash"}, true},
+		{"kdevtmpfsi miner", procFacts{PID: 4321, Name: "kdevtmpfsi"}, true},
+		{"fake kthreadd", procFacts{PID: 9999, Name: "kthreadd"}, true},
+		{"real kthreadd at pid 2 is fine", procFacts{PID: 2, Name: "kthreadd"}, false},
+		{"real kdevtmpfs kernel thread is fine", procFacts{PID: 39, Name: "kdevtmpfs"}, false},
+		{"binary from /tmp", procFacts{PID: 555, Name: "payload", Exe: "/tmp/payload", Cmdline: "/tmp/payload", ParentExe: "/bin/bash"}, true},
+		{"dot-tmp executable", procFacts{PID: 556, Name: "x", Exe: "/opt/x.tmp", Cmdline: "/opt/x.tmp", ParentExe: "/bin/bash"}, true},
+		{"benign nginx", procFacts{PID: 100, Name: "nginx", Exe: "/usr/sbin/nginx", Cmdline: "nginx: master process", ParentExe: "/sbin/init"}, false},
+
+		// Go's own work directory, launched by the real toolchain.
+		{"go test binary under go test", goTest(nil), false},
+		{"go test under a -C invocation", goTest(func(f *procFacts) { f.ParentCmdline = "go -C agent test ./..." }), false},
+		{"go run binary under go run", procFacts{PID: 777, Name: "main", Exe: "/tmp/go-build123/b001/exe/main", Cmdline: "/tmp/go-build123/b001/exe/main",
+			ParentExe: "/usr/local/go/bin/go", ParentCmdline: "go run ./cmd/tool", Age: time.Minute}, false},
+		{"go run binary under system go via /usr/bin", procFacts{PID: 777, Name: "main", Exe: "/tmp/go-build123/b001/exe/main",
+			ParentExe: "/usr/lib/go-1.26/bin/go", ParentCmdline: "/usr/bin/go run main.go", Age: time.Minute}, false},
+
+		// Same shape, but something is off → still flagged.
+		{"spawned by a shell", goTest(func(f *procFacts) { f.ParentExe = "/bin/bash"; f.ParentCmdline = "bash" }), true},
+		{"parent unknown (unreadable /proc/<ppid>/exe)", goTest(func(f *procFacts) { f.ParentExe = ""; f.ParentCmdline = "" }), true},
+		{"re-parented to PID 1 after go exited", goTest(func(f *procFacts) { f.ParentExe = "/usr/lib/systemd/systemd"; f.ParentCmdline = "/sbin/init splash" }), true},
+		{"parent named go in /tmp", goTest(func(f *procFacts) { f.ParentExe = "/tmp/x/go" }), true},
+		{"parent named go in /dev/shm", goTest(func(f *procFacts) { f.ParentExe = "/dev/shm/go" }), true},
+		{"parent go binary deleted", goTest(func(f *procFacts) { f.ParentExe = goTool + " (deleted)" }), true},
+		{"parent go but not test/run", goTest(func(f *procFacts) { f.ParentCmdline = "go build ./..." }), true},
+		{"parent go with no subcommand", goTest(func(f *procFacts) { f.ParentCmdline = "go" }), true},
+		{"alive longer than the cap (go run miner.go)", goTest(func(f *procFacts) { f.ParentCmdline = "go run miner.go"; f.Age = 31 * time.Minute }), true},
+		{"age unknown", goTest(func(f *procFacts) { f.Age = 0 }), true},
+		{"dropper elsewhere inside a go-build dir", goTest(func(f *procFacts) { f.Exe = "/tmp/go-build1/payload"; f.Cmdline = "/tmp/go-build1/payload" }), true},
+		{"miner named like a go test binary is still flagged by name", goTest(func(f *procFacts) { f.Name = "xmrig"; f.Exe = "/tmp/go-build1/b001/xmrig.test" }), true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := suspicionReason(tt.pid, tt.procName, tt.exe, tt.cmdline)
+			got := suspicionReason(tt.f)
 			if (got != "") != tt.wantFlagged {
 				t.Errorf("suspicionReason() = %q, wantFlagged=%v", got, tt.wantFlagged)
 			}
 		})
+	}
+}
+
+func TestGoSubcommand(t *testing.T) {
+	cases := map[string]string{
+		"go test ./...":                "test",
+		"/usr/bin/go run main.go":      "run",
+		"go -C agent test -race ./...": "test",
+		"go -mod=mod build ./...":      "build",
+		"go":                           "",
+		"":                             "",
+		"go -C":                        "",
+	}
+	for in, want := range cases {
+		if got := goSubcommand(in); got != want {
+			t.Errorf("goSubcommand(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
