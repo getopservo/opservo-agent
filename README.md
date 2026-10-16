@@ -62,8 +62,9 @@ recognise can still get through, so don't log secrets.
   unsigned or wrongly signed payloads.
 - **Offline buffer.** If the API cannot be reached, recent heartbeats are kept
   in a local SQLite file and replayed, one per heartbeat, once the API is back.
-- **TLS.** Certificates are verified. `--dev` turns verification off and is
-  for local development only.
+- **TLS.** Certificates are verified. `--dev` turns verification off only when
+  the API URL is localhost / a loopback address; against any other API it just
+  turns on verbose logging.
 
 ## Remote actions (commands from the dashboard)
 
@@ -172,14 +173,14 @@ also accepted):
 |------|-----|---------|
 | `--api-url` | `OPSERVO_API_URL` | `https://api.getopservo.com` |
 | `--agent-id` | `OPSERVO_AGENT_ID` | set at registration |
-| `--secret-key` | `OPSERVO_SECRET_KEY` | set at registration |
+| `--secret-key` | `OPSERVO_SECRET_KEY` | set at registration. Prefer the env var / config file: a command-line flag is visible to every user in `ps`, and the agent warns when it is used |
 | `--enable-actions` | `OPSERVO_ENABLE_ACTIONS` | `true` (polling; see above) |
 | `--enable-probes` | `OPSERVO_ENABLE_PROBES` | `false` |
 | `--enable-shell` | `OPSERVO_ENABLE_SHELL` | `false` (see "Live terminal") |
 | `--auto-update` | `OPSERVO_AUTO_UPDATE` | `true` |
 | `--buffer-path` | `OPSERVO_BUFFER_PATH` | `~/.infrapilot/agent-buffer.db` (`/root/.infrapilot/…` under the installed unit) |
 | `--interval` | | `60s` |
-| `--dev` | | off (verbose logs, **no TLS verification** — local development only) |
+| `--dev` | | off (verbose logs; skips TLS verification only for a loopback API URL — local development only) |
 
 ## Updates and signing
 
