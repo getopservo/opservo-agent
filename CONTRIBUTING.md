@@ -1,6 +1,7 @@
 # Contributing
 
-Thanks for taking the time to help.
+Thanks for taking the time to help. Everyone taking part follows the
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
 - **Bugs and ideas:** open a GitHub issue. Say what you ran, what you expected,
   and what happened. Agent logs (`journalctl -u infrapilot-agent`) help.

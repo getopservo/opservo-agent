@@ -214,4 +214,6 @@ Embedded public keys:
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). The
+licenses of the Go modules compiled into the agent are listed in
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
