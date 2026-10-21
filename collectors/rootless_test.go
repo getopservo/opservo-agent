@@ -1,7 +1,9 @@
 package collectors
 
 import (
+	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -29,16 +31,24 @@ func TestFindRootlessDockerDaemonsSkipFlag(t *testing.T) {
 }
 
 func TestParseRootlessDaemonsRoundTrip(t *testing.T) {
-	got := parseRootlessDaemons("1001\t1001\talice\t/home/alice\t/run/user/1001/docker.sock\nbad line\n")
+	// The daemon must belong to someone other than the user running the test:
+	// cred() deliberately returns nil for the agent's own uid. GitHub-hosted
+	// runners run as uid 1001, so a fixed 1001 here was "ourselves" there.
+	uid := uint32(1001)
+	if uint32(os.Geteuid()) == uid {
+		uid = 1002
+	}
+	u := strconv.FormatUint(uint64(uid), 10)
+	got := parseRootlessDaemons(u + "\t" + u + "\talice\t/home/alice\t/run/user/" + u + "/docker.sock\nbad line\n")
 	if len(got) != 1 {
 		t.Fatalf("got %+v", got)
 	}
 	d := got[0]
-	if d.UID != 1001 || d.GID != 1001 || d.User != "alice" || d.Home != "/home/alice" || d.Socket != "/run/user/1001/docker.sock" {
+	if d.UID != uid || d.GID != uid || d.User != "alice" || d.Home != "/home/alice" || d.Socket != "/run/user/"+u+"/docker.sock" {
 		t.Errorf("got %+v", d)
 	}
 	env := d.env()
-	if env[0] != "DOCKER_HOST=unix:///run/user/1001/docker.sock" || env[1] != "HOME=/home/alice" {
+	if env[0] != "DOCKER_HOST=unix:///run/user/"+u+"/docker.sock" || env[1] != "HOME=/home/alice" {
 		t.Errorf("env = %v", env)
 	}
 	for _, e := range env {
@@ -46,11 +56,17 @@ func TestParseRootlessDaemonsRoundTrip(t *testing.T) {
 			t.Errorf("unexpected env %q (the agent's own environment must not leak)", e)
 		}
 	}
-	if d.cred() == nil {
-		t.Error("a non-root owner must get a credential drop")
+	c := d.cred()
+	if c == nil {
+		t.Fatal("a daemon owned by another user must get a credential drop")
 	}
-	if c := d.cred(); c.Uid != 1001 || c.Gid != 1001 {
+	if c.Uid != uid || c.Gid != uid {
 		t.Errorf("cred = %+v", c)
+	}
+	// And the agent's own daemon needs no drop.
+	self := rootlessDaemon{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}
+	if self.cred() != nil {
+		t.Error("a daemon owned by the agent's own user must not get a credential drop")
 	}
 }
 
