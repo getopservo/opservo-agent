@@ -333,14 +333,32 @@ func (c *LogsCollector) collectDockerLogs(ctx context.Context) []LogEntry {
 		return nil
 	}
 	var entries []LogEntry
-	for _, c := range listContainers(ctx) {
-		name := c.Name
+	for _, ref := range listContainers(ctx) {
 		// Capped: 200 lines of a container that logs 1 MB JSON lines would
 		// otherwise be ~200 MB held in memory every minute.
-		logs, err := runCmdTail(ctx, defaultCmdTimeout, maxDockerLogBytes, "docker", "logs", "--tail", "200", "--since", "1h", "--timestamps", name)
+		logs, err := runCmdTail(ctx, defaultCmdTimeout, maxDockerLogBytes, "docker", "logs", "--tail", "200", "--since", "1h", "--timestamps", ref.Name)
 		if err != nil {
 			continue
 		}
+		entries = append(entries, parseDockerLogLines(ref.Name, logs)...)
+	}
+	// Rootless daemons: same tail, run as the owning user (rootless.go).
+	for _, d := range sharedRootlessDaemons(ctx) {
+		for _, ref := range d.containers(ctx) {
+			logs, err := d.logTail(ctx, ref.Name)
+			if err != nil {
+				continue
+			}
+			entries = append(entries, parseDockerLogLines(ref.Name, logs)...)
+		}
+	}
+	return entries
+}
+
+// parseDockerLogLines turns `docker logs --timestamps` output into entries.
+func parseDockerLogLines(name string, logs []byte) []LogEntry {
+	var entries []LogEntry
+	{
 		scanner := bufio.NewScanner(strings.NewReader(string(logs)))
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		var lines []LogEntry

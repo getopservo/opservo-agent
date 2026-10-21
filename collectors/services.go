@@ -26,6 +26,9 @@ type ServiceInfo struct {
 	MemoryBytes  uint64  `json:"memory_bytes,omitempty"`
 	RestartCount int     `json:"restart_count"`
 	Description  string  `json:"description,omitempty"`
+	// Owner: the Linux user whose daemon runs this service, when it is not the
+	// system one — a rootless Docker container ("alice") or a per-user PM2 app.
+	Owner string `json:"owner,omitempty"`
 
 	// Failed systemd units only (see scheduledjobs.go): what kind of unit it
 	// is and how its last run ended, so a timer job is judged on its last run.
@@ -96,6 +99,12 @@ func (s *ServiceCollector) Collect(ctx context.Context) (interface{}, error) {
 	if hasBinary("docker") {
 		report.DockerInstalled = true
 		report.Services = append(report.Services, collectDocker(ctx)...)
+	}
+	// Rootless daemons run by login users are invisible to the root daemon;
+	// discovered by their socket, queried as their owner (rootless.go).
+	if rootless := collectRootlessDocker(ctx); len(rootless) > 0 {
+		report.DockerInstalled = true
+		report.Services = append(report.Services, rootless...)
 	}
 	// PM2 is found by its daemon process, not by `pm2` on root's PATH: most
 	// installs are per-user (nvm, ~/.npm-global) and invisible to root.
@@ -196,16 +205,26 @@ func runCmdEnv(ctx context.Context, extraEnv []string, name string, args ...stri
 
 // runCmdInto runs a command like runCmdEnv but streams stdout into w.
 func runCmdInto(ctx context.Context, extraEnv []string, w io.Writer, name string, args ...string) error {
+	return runCmdIntoAs(ctx, nil, extraEnv, w, name, args...)
+}
+
+// runCmdIntoAs is runCmdInto with an optional identity: when cred is set the
+// child runs as that uid/gid (the agent runs as root) with ONLY env as its
+// environment — nothing of the agent's own environment leaks to another
+// user's process. Used for per-user daemons (rootless Docker).
+func runCmdIntoAs(ctx context.Context, cred *syscall.Credential, env []string, w io.Writer, name string, args ...string) error {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, defaultCmdTimeout)
 		defer cancel()
 	}
 	cmd := exec.CommandContext(ctx, name, args...)
-	if len(extraEnv) > 0 {
-		cmd.Env = append(os.Environ(), extraEnv...)
+	if cred != nil {
+		cmd.Env = env
+	} else if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Credential: cred}
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
 			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
@@ -373,7 +392,19 @@ func collectDocker(ctx context.Context) []ServiceInfo {
 	if err != nil {
 		return nil
 	}
+	services, ids := parseDockerPSJSON(out)
 
+	// RestartCount is not exposed by `docker ps`; fetch it in one inspect call.
+	applyRestartCounts(services, dockerRestartCounts(ctx, ids))
+
+	// Live CPU% + memory per container, in one `docker stats` call.
+	applyContainerStats(services, dockerStats(ctx))
+	return services
+}
+
+// parseDockerPSJSON turns `docker ps --format json` (one object per line) into
+// docker ServiceInfo rows plus the container ids, for the inspect call.
+func parseDockerPSJSON(out []byte) ([]ServiceInfo, []string) {
 	var services []ServiceInfo
 	var ids []string
 	scanner := bufio.NewScanner(bytes.NewReader(out))
@@ -402,27 +433,24 @@ func collectDocker(ctx context.Context) []ServiceInfo {
 			ids = append(ids, c.ID)
 		}
 	}
+	return services, ids
+}
 
-	// RestartCount is not exposed by `docker ps`; fetch it in one inspect call.
-	restarts := dockerRestartCounts(ctx, ids)
-	if len(restarts) > 0 {
-		for i := range services {
-			name := services[i].Name
-			if rc, ok := restarts[name]; ok {
-				services[i].RestartCount = rc
-			}
+func applyRestartCounts(services []ServiceInfo, restarts map[string]int) {
+	for i := range services {
+		if rc, ok := restarts[services[i].Name]; ok {
+			services[i].RestartCount = rc
 		}
 	}
+}
 
-	// Live CPU% + memory per container, in one `docker stats` call.
-	stats := dockerStats(ctx)
+func applyContainerStats(services []ServiceInfo, stats map[string]containerStat) {
 	for i := range services {
 		if s, ok := stats[services[i].Name]; ok {
 			services[i].CPUPercent = s.cpu
 			services[i].MemoryBytes = s.mem
 		}
 	}
-	return services
 }
 
 type containerStat struct {
@@ -439,6 +467,11 @@ func dockerStats(ctx context.Context) map[string]containerStat {
 	if err != nil {
 		return nil
 	}
+	return parseDockerStatsBrief(out)
+}
+
+// parseDockerStatsBrief reads Name\tCPU%\tMemUsage rows into CPU% + used bytes.
+func parseDockerStatsBrief(out []byte) map[string]containerStat {
 	stats := make(map[string]containerStat)
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	for scanner.Scan() {
@@ -487,6 +520,10 @@ func dockerRestartCounts(ctx context.Context, ids []string) map[string]int {
 	if err != nil {
 		return nil
 	}
+	return parseRestartCounts(out)
+}
+
+func parseRestartCounts(out []byte) map[string]int {
 	counts := make(map[string]int)
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	for scanner.Scan() {
@@ -519,6 +556,7 @@ func collectPM2(ctx context.Context) []ServiceInfo {
 		}
 		if a.User != "" {
 			svc.Description = "PM2 app run by " + a.User
+			svc.Owner = a.User
 		}
 		services = append(services, svc)
 	}

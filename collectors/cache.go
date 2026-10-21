@@ -28,7 +28,12 @@ var (
 
 func cachedCmd(ctx context.Context, ttl, timeout time.Duration, name string, args ...string) ([]byte, error) {
 	key := name + "\x00" + strings.Join(args, "\x00")
+	return cachedRun(key, ttl, func() ([]byte, error) { return runCmdTimeout(ctx, timeout, name, args...) })
+}
 
+// cachedRun is the cache + singleflight behind cachedCmd for any runner
+// (e.g. a command run as another user, where the key must carry the identity).
+func cachedRun(key string, ttl time.Duration, run func() ([]byte, error)) ([]byte, error) {
 	cmdCacheMu.Lock()
 	if r, ok := cmdCache[key]; ok && time.Since(r.at) < ttl {
 		cmdCacheMu.Unlock()
@@ -53,7 +58,7 @@ func cachedCmd(ctx context.Context, ttl, timeout time.Duration, name string, arg
 	}
 	cmdCacheMu.Unlock()
 
-	out, err := runCmdTimeout(ctx, timeout, name, args...)
+	out, err := run()
 
 	cmdCacheMu.Lock()
 	cmdCache[key] = cmdResult{out: out, err: err, at: time.Now()}

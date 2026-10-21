@@ -22,6 +22,9 @@ type ContainerStat struct {
 	Project string          `json:"project,omitempty"` // docker compose project
 	Status  string          `json:"status,omitempty"`  // e.g. "Up 4 weeks", "Restarting (1) 12 seconds ago"
 	Ports   []PublishedPort `json:"ports,omitempty"`   // host ports published to the container
+	// Owner: the login user whose ROOTLESS daemon runs the container; empty
+	// for the system daemon (rootless.go).
+	Owner string `json:"owner,omitempty"`
 }
 
 // PublishedPort is one host port Docker forwards into a container.
@@ -52,18 +55,36 @@ func (c *ContainersCollector) Collect(ctx context.Context) (interface{}, error) 
 	// --no-stream takes one sample and exits; bound it so a hung dockerd can't
 	// stall the heartbeat. Shared with the services collector so this runs once
 	// per cycle instead of twice.
-	out, err := sharedDockerStats(ctx)
-	if err != nil {
-		return info, nil // docker present but not usable (no daemon / perms) — skip quietly
+	if out, err := sharedDockerStats(ctx); err == nil {
+		info.Available = true
+		info.Containers = parseDockerStats(string(out))
+		if ps, err := cachedCmd(ctx, 30*time.Second, 8*time.Second, "docker", "ps", "--no-trunc",
+			"--format", containerPSFormat); err == nil {
+			mergeDockerPS(info.Containers, string(ps))
+		}
 	}
-	info.Available = true
-	info.Containers = parseDockerStats(string(out))
-	if ps, err := cachedCmd(ctx, 30*time.Second, 8*time.Second, "docker", "ps", "--no-trunc",
-		"--format", `{{.Names}}\t{{.Image}}\t{{.Label "com.docker.compose.project"}}\t{{.Status}}\t{{.Ports}}`); err == nil {
-		mergeDockerPS(info.Containers, string(ps))
+	// docker present but not usable as root (no system daemon / perms) is not
+	// an error: the host may only run rootless daemons.
+	for _, d := range sharedRootlessDaemons(ctx) {
+		out, err := d.stats(ctx)
+		if err != nil {
+			continue
+		}
+		rows := parseDockerStats(string(out))
+		if ps, err := d.run(ctx, 8*time.Second, "ps", "--no-trunc", "--format", containerPSFormat); err == nil {
+			mergeDockerPS(rows, string(ps))
+		}
+		for i := range rows {
+			rows[i].Owner = d.User
+		}
+		info.Available = true
+		info.Containers = append(info.Containers, rows...)
 	}
 	return info, nil
 }
+
+// containerPSFormat is the `docker ps` row mergeDockerPS parses.
+const containerPSFormat = `{{.Names}}\t{{.Image}}\t{{.Label "com.docker.compose.project"}}\t{{.Status}}\t{{.Ports}}`
 
 // mergeDockerPS adds image / compose project / status / published ports from
 // `docker ps` rows (Name\tImage\tProject\tStatus\tPorts) onto the stats rows.

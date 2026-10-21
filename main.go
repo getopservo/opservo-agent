@@ -187,6 +187,7 @@ func main() {
 		collectors.NewScheduledCollector(),
 		collectors.NewUsersCollector(),
 		collectors.NewPackagesCollector(),
+		collectors.NewChangesCollector(buf),
 		collectors.NewActionsCollector(*enableActions, *enableActions && *enableShell, shell.LoginUsers),
 		collectors.NewProbesCollector(*enableProbes),
 		collectors.NewAgentInfoCollector(version),

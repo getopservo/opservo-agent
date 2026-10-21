@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,75 @@ type UpdatesInfo struct {
 	// BackupStatus: best-effort — "ok" (a backup timer is enabled), "stale" (a
 	// backup unit exists but isn't scheduled), or "" (none detected → no claim).
 	BackupStatus string `json:"backup_status,omitempty"`
+
+	// Patch status detail (18 Oct 2026). Which security updates are pending,
+	// not just how many: the kernel and the packages attackers reach first
+	// (OpenSSL, OpenSSH, glibc, sudo, the web server, PHP, the databases) are
+	// tagged so the dashboard can offer "install these first" as one command.
+	// apt: parsed from `apt list --upgradable`; dnf/yum: `dnf updateinfo list
+	// --security`. Capped at maxSecurityPackages, kernel + high-exposure first.
+	SecurityPackages    []PendingUpdate `json:"security_packages,omitempty"`
+	KernelUpdatePending bool            `json:"kernel_update_pending,omitempty"`
+	HighExposurePending []string        `json:"high_exposure_pending,omitempty"`
+}
+
+// PendingUpdate is one package with a newer security version available.
+type PendingUpdate struct {
+	Name         string `json:"name"`
+	From         string `json:"from,omitempty"`
+	To           string `json:"to,omitempty"`
+	Kernel       bool   `json:"kernel,omitempty"`
+	HighExposure bool   `json:"high_exposure,omitempty"`
+}
+
+const maxSecurityPackages = 60
+
+// reKernelPkg: the running-kernel packages on Debian/Ubuntu and RHEL-likes.
+var reKernelPkg = regexp.MustCompile(`^(linux-image|linux-generic|linux-virtual|linux-aws|linux-gcp|linux-azure|linux-oracle|linux-kvm|linux-modules|linux-headers|kernel|kernel-core|kernel-modules)(-|$)`)
+
+// reHighExposure: packages whose vulnerabilities are reachable from the network
+// or give root at once — what an attacker scans for, and what to patch first.
+var reHighExposure = regexp.MustCompile(`^(openssl|libssl[0-9.]*|openssh-server|openssh|libc6|libc-bin|glibc|sudo|polkit|policykit-1|systemd|dbus|bash|nginx|nginx-[a-z]+|apache2|httpd|caddy|haproxy|php[0-9.]*(-fpm|-cli|-common|-mysql)?|libphp[0-9.]*|mysql-server[0-9.-]*|mariadb-server[0-9.-]*|percona-server-server.*|postgresql(-[0-9.]+)?(-server)?|redis-server|redis|mongodb-org-server|memcached|docker-ce|docker\.io|containerd(\.io)?|runc|nodejs|node|curl|libcurl[0-9a-z]*|wget|git|libxml2|zlib1g|libexpat1|expat|bind9|named|postfix|exim4|dovecot-core|vsftpd|samba|smbd|kubelet|libgnutls[0-9]*|gnutls|libnss3|nss|libkrb5-[0-9]|krb5-libs|xz-utils|liblzma[0-9]*|tar|unzip|libtiff[0-9]*|imagemagick|ghostscript|libwebp[0-9]*|libpng[0-9-]*|ca-certificates)$`)
+
+func isKernelPackage(name string) bool { return reKernelPkg.MatchString(name) }
+func isHighExposure(name string) bool  { return reHighExposure.MatchString(name) }
+
+// fillPatchDetail sets the detail fields from a list of pending security
+// updates: kernel/high-exposure first, capped, plus the two summary fields.
+func fillPatchDetail(info *UpdatesInfo, sec []PendingUpdate) {
+	seen := map[string]bool{}
+	for i := range sec {
+		sec[i].Kernel = isKernelPackage(sec[i].Name)
+		sec[i].HighExposure = isHighExposure(sec[i].Name)
+		if sec[i].Kernel {
+			info.KernelUpdatePending = true
+		}
+		if sec[i].HighExposure && !seen[sec[i].Name] {
+			seen[sec[i].Name] = true
+			info.HighExposurePending = append(info.HighExposurePending, sec[i].Name)
+		}
+	}
+	sort.SliceStable(sec, func(i, j int) bool {
+		ri, rj := patchRank(sec[i]), patchRank(sec[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return sec[i].Name < sec[j].Name
+	})
+	if len(sec) > maxSecurityPackages {
+		sec = sec[:maxSecurityPackages]
+	}
+	info.SecurityPackages = sec
+}
+
+func patchRank(p PendingUpdate) int {
+	switch {
+	case p.Kernel:
+		return 0
+	case p.HighExposure:
+		return 1
+	}
+	return 2
 }
 
 type UpdatesCollector struct{}
@@ -73,9 +143,33 @@ func (u *UpdatesCollector) Collect(ctx context.Context) (interface{}, error) {
 	if hasBinary("apt") {
 		if out, err := sharedAptUpgradable(ctx); err == nil { // shared with packages collector
 			info.Available = true
-			info.Pending, info.SecurityPending = parseAptUpgradable(string(out))
+			var sec []PendingUpdate
+			info.Pending, info.SecurityPending, sec = parseAptUpgradableDetail(string(out))
+			fillPatchDetail(info, sec)
 			return info, nil
 		}
+	}
+
+	// RHEL / Fedora / Amazon Linux: dnf (or yum). `check-update` exits 100 when
+	// updates exist, so its error is expected; `updateinfo list --security`
+	// names the security ones; `needs-restarting -r` exits 1 when a reboot is
+	// due (no flag file on these systems).
+	if dnf := firstBinary("dnf", "yum"); dnf != "" {
+		info.Available = true
+		if out, _ := runCmdTimeout(ctx, 10*time.Second, dnf, "-q", "check-update"); len(out) > 0 {
+			info.Pending = parseDnfCheckUpdate(string(out))
+		}
+		if out, err := runCmdTimeout(ctx, 10*time.Second, dnf, "-q", "updateinfo", "list", "--security"); err == nil || len(out) > 0 {
+			sec := parseDnfUpdateinfo(string(out))
+			info.SecurityPending = len(sec)
+			fillPatchDetail(info, sec)
+		}
+		if !info.RebootRequired && hasBinary("needs-restarting") {
+			if _, err := runCmdTimeout(ctx, 10*time.Second, "needs-restarting", "-r"); err != nil {
+				info.RebootRequired = true
+			}
+		}
+		return info, nil
 	}
 
 	// Fallback (no apt): update-notifier's cached summary.
@@ -162,6 +256,16 @@ func parseAutoremoveCount(out string) int {
 //
 //	pkg/jammy-updates,jammy-security 1.2.3 amd64 [upgradable from: 1.2.0]
 func parseAptUpgradable(out string) (pending, security int) {
+	pending, security, _ = parseAptUpgradableDetail(out)
+	return pending, security
+}
+
+var reUpgradableFrom = regexp.MustCompile(`\[upgradable from: ([^\]]+)\]`)
+
+// parseAptUpgradableDetail is parseAptUpgradable plus the security packages
+// themselves (name, current → new version). Kernel / high-exposure tags are
+// filled by fillPatchDetail.
+func parseAptUpgradableDetail(out string) (pending, security int, sec []PendingUpdate) {
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "Listing") {
@@ -173,15 +277,87 @@ func parseAptUpgradable(out string) (pending, security int) {
 		}
 		pending++
 		// The package's suites sit between the first '/' and the next space.
-		suites := line[slash+1:]
-		if sp := strings.IndexByte(suites, ' '); sp >= 0 {
-			suites = suites[:sp]
+		rest := line[slash+1:]
+		suites := rest
+		if sp := strings.IndexByte(rest, ' '); sp >= 0 {
+			suites = rest[:sp]
+			rest = strings.TrimSpace(rest[sp+1:])
+		} else {
+			rest = ""
 		}
-		if strings.Contains(strings.ToLower(suites), "security") {
-			security++
+		if !strings.Contains(strings.ToLower(suites), "security") {
+			continue
+		}
+		security++
+		p := PendingUpdate{Name: line[:slash]}
+		if f := strings.Fields(rest); len(f) > 0 {
+			p.To = f[0]
+		}
+		if m := reUpgradableFrom.FindStringSubmatch(rest); m != nil {
+			p.From = m[1]
+		}
+		sec = append(sec, p)
+	}
+	return pending, security, sec
+}
+
+// firstBinary returns the first name on PATH, or "".
+func firstBinary(names ...string) string {
+	for _, n := range names {
+		if hasBinary(n) {
+			return n
 		}
 	}
-	return pending, security
+	return ""
+}
+
+// parseDnfCheckUpdate counts the package lines of `dnf -q check-update`:
+//
+//	nginx.x86_64        1:1.20.1-14.el9        appstream
+//	Obsoleting Packages
+//	…
+//
+// Lines after "Obsoleting Packages" are skipped (they repeat packages).
+func parseDnfCheckUpdate(out string) int {
+	n := 0
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "Obsoleting") {
+			break
+		}
+		if f := strings.Fields(line); len(f) == 3 && strings.Contains(f[0], ".") {
+			n++
+		}
+	}
+	return n
+}
+
+// parseDnfUpdateinfo reads `dnf -q updateinfo list --security`:
+//
+//	RHSA-2026:1234 Important/Sec. openssl-1:3.0.7-28.el9.x86_64
+//	FEDORA-2026-abcd Moderate/Sec.  curl-8.6.0-5.fc40.x86_64
+//
+// One advisory per line; the same package can appear under several
+// advisories, so names are de-duplicated (highest line wins, versions equal).
+func parseDnfUpdateinfo(out string) []PendingUpdate {
+	seen := map[string]bool{}
+	var sec []PendingUpdate
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 || !strings.Contains(f[1], "Sec") {
+			continue
+		}
+		name, ver := splitNEVRA(f[len(f)-1])
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		sec = append(sec, PendingUpdate{Name: name, To: ver})
+	}
+	return sec
 }
 
 // detectExtendedSupport reports whether Ubuntu Pro/ESM is attached with an ESM

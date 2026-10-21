@@ -77,8 +77,13 @@ func listContainers(ctx context.Context) []containerRef {
 	if err != nil {
 		return nil
 	}
+	return parseContainerRefs(string(out))
+}
+
+// parseContainerRefs parses `docker ps --format "{{.Names}}\t{{.Image}}"`.
+func parseContainerRefs(out string) []containerRef {
 	var refs []containerRef
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		f := strings.SplitN(line, "\t", 2)
 		name := strings.TrimSpace(f[0])
 		if name == "" {

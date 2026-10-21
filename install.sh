@@ -6,6 +6,11 @@
 #
 #   (the dashboard's "Add Server" flow gives you this exact command)
 #
+#   Prefer to keep the token out of your shell history and `ps`? Add --prompt
+#   and the installer asks for it on the terminal (not echoed):
+#
+#   curl -sSL https://api.getopservo.com/install.sh | sudo bash -s -- --prompt
+#
 # What it does:
 #   1. Detects the Linux distro + CPU architecture.
 #   2. Downloads the matching agent binary from the Opservo API (or
@@ -63,6 +68,7 @@ fi
 VERSION="${OPSERVO_VERSION:-${INFRAPILOT_VERSION:-latest}}"
 TENANT_ID="${OPSERVO_TENANT_ID:-${INFRAPILOT_TENANT_ID:-}}"
 ENROLLMENT_TOKEN="${OPSERVO_TOKEN:-${INFRAPILOT_TOKEN:-}}"   # from the dashboard "Add New Server" flow
+PROMPT_TOKEN=0   # --prompt: read the token from the terminal instead of the environment
 FORCE="${OPSERVO_FORCE:-${INFRAPILOT_FORCE:-0}}"
 UNINSTALL="${OPSERVO_UNINSTALL:-${INFRAPILOT_UNINSTALL:-0}}"  # set to 1 to remove the agent instead
 
@@ -755,12 +761,63 @@ uninstall() {
   success "Opservo agent removed from this server."
 }
 
+# ── Arguments ─────────────────────────────────────────────────────────────────
+# Everything is env-driven so the one-liner stays `… | sudo env … bash`; the
+# few flags exist for what an env var can't do well.
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prompt)    PROMPT_TOKEN=1 ;;
+      --uninstall) UNINSTALL=1 ;;
+      --force)     FORCE=1 ;;
+      -h|--help)
+        sed -n '2,40p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+        exit 0
+        ;;
+      *) fail "Unknown option: $1 (use --prompt, --force, --uninstall)" ;;
+    esac
+    shift
+  done
+}
+
+# prompt_for_token reads the enrollment token from the terminal with echo off,
+# so it never appears on a command line, in shell history, or in `ps`. The
+# script itself arrives on stdin (`curl … | bash`), so the terminal is opened
+# directly as /dev/tty; without one (CI, a pasted heredoc) the user is told to
+# use the OPSERVO_TOKEN form instead of silently hanging or registering tokenless.
+prompt_for_token() {
+  if [ -n "${ENROLLMENT_TOKEN}" ]; then
+    info "An enrollment token was supplied in the environment; --prompt ignored."
+    return
+  fi
+  # /dev/tty exists even with no controlling terminal; opening it is the test.
+  if ! { : </dev/tty; } 2>/dev/null; then
+    fail "--prompt needs an interactive terminal. Without one, pass the token as OPSERVO_TOKEN=<token> instead."
+  fi
+  local token=""
+  printf 'Paste the enrollment token from Add Server (it is not shown as you type): ' >/dev/tty
+  IFS= read -rs token </dev/tty || true
+  printf '\n' >/dev/tty
+  token="${token//[[:space:]]/}"
+  [ -n "${token}" ] || fail "No token entered."
+  case "${token}" in
+    ipk_*|fleet_*) : ;;
+    *) warn "That does not look like an Opservo enrollment token (expected ipk_… or fleet_…); trying it anyway." ;;
+  esac
+  ENROLLMENT_TOKEN="${token}"
+  success "Token received."
+}
+
 main() {
+  parse_args "$@"
   if [ "${UNINSTALL}" = "1" ]; then
     uninstall
     return
   fi
   printf '%s%sOpservo agent installer%s\n\n' "${C_BLUE}" "${C_BOLD}" "${C_RESET}"
+  if [ "${PROMPT_TOKEN}" = "1" ]; then
+    prompt_for_token
+  fi
   detect_platform
   download_binary
   resolve_credentials

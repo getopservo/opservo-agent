@@ -1,6 +1,7 @@
 package collectors
 
 import (
+	"os"
 	"context"
 	"fmt"
 	"net/http"
@@ -133,17 +134,37 @@ func (p *ProcessCollector) Collect(ctx context.Context) (interface{}, error) {
 	}
 	procCPUMu.Unlock()
 
-	// Keep the top consumers (CPU first, then memory) to bound the payload.
+	return topProcesses(result, int32(os.Getpid()), maxProcesses), nil
+}
+
+// topProcesses keeps the top consumers (CPU first, then memory) to bound the
+// payload, and ALWAYS keeps the agent's own process (selfPID) even when it is
+// outside the top N: the public agent-overhead benchmark reads the agent's
+// CPU and memory from this list, and dropping it only on busy servers would
+// bias that figure toward servers where the agent is a top consumer.
+func topProcesses(result []ProcessInfo, selfPID int32, max int) []ProcessInfo {
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].CPU != result[j].CPU {
 			return result[i].CPU > result[j].CPU
 		}
 		return result[i].MemMB > result[j].MemMB
 	})
-	if len(result) > maxProcesses {
-		result = result[:maxProcesses]
+	if len(result) <= max {
+		return result
 	}
-	return result, nil
+	var self *ProcessInfo
+	for i := max; i < len(result); i++ {
+		if result[i].PID == selfPID {
+			p := result[i]
+			self = &p
+			break
+		}
+	}
+	result = result[:max]
+	if self != nil {
+		result = append(result, *self)
+	}
+	return result
 }
 
 // nonHTTPPorts are well-known ports we never send an HTTP GET to (databases,
