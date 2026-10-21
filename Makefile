@@ -4,11 +4,9 @@ BINARY=infrapilot-agent
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 # Release build: the flags and the digest-pinned Go toolchain of the official
-# agent build. From Opservo's internal source tree, `make release-docker`
-# reproduces the binaries listed in
-# https://api.getopservo.com/download/manifest.json byte for byte. The public
-# opservo-agent repository uses a different Go module path, which is compiled
-# into the binary, so a build from it has different hashes.
+# agent build. `make release-docker` reproduces the binaries listed in
+# https://api.getopservo.com/download/manifest.json byte for byte, from a
+# checkout of the commit that production was built from.
 #   - version string = hash of the agent source (*.go + go.mod + go.sum)
 #   - -trimpath, -buildvcs=false, CGO off, stripped (-s -w)
 #   - GO_IMAGE moves together with the official build's Go image
