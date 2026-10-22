@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/getopservo/opservo-agent/paths"
 )
 
 // MySQLStat is one MySQL/MariaDB instance's key health metrics (SHOW GLOBAL
@@ -50,7 +52,7 @@ type MySQLStat struct {
 }
 
 // MySQLInfo: per-instance MySQL metrics. OPT-IN and credential-respecting: the
-// agent uses its OWN /etc/infrapilot/mysql.cnf (a [client] option file the
+// agent uses its OWN /etc/opservo/mysql.cnf (a [client] option file the
 // operator creates with a read-only monitoring user) — it NEVER reads the app's
 // .env. Falls back to local socket auth (root@localhost via auth_socket).
 type MySQLInfo struct {
@@ -63,7 +65,8 @@ type MySQLCollector struct{}
 func NewMySQLCollector() *MySQLCollector { return &MySQLCollector{} }
 func (m *MySQLCollector) Name() string   { return "mysql" }
 
-const mysqlConfigPath = "/etc/infrapilot/mysql.cnf"
+// mysqlConfigPath is read on each collect, so a migrated box picks up the new dir.
+func mysqlConfigPath() string { return paths.ConfigFile("mysql.cnf") }
 
 const mysqlQuery = "SHOW GLOBAL STATUS; " +
 	"SHOW GLOBAL VARIABLES WHERE Variable_name IN ('max_connections','slow_query_log','long_query_time','slow_query_log_file','innodb_buffer_pool_size','log_output','datadir'); " +
@@ -98,8 +101,8 @@ func (m *MySQLCollector) Collect(ctx context.Context) (interface{}, error) {
 	// 1. Local MySQL via the host client (opt-in cnf, else socket auth).
 	if bin := mysqlClientBin(); bin != "" {
 		base := []string{"--connect-timeout=2", "-N", "-B"}
-		if _, err := os.Stat(mysqlConfigPath); err == nil {
-			base = append([]string{"--defaults-extra-file=" + mysqlConfigPath}, base...)
+		if _, err := os.Stat(mysqlConfigPath()); err == nil {
+			base = append([]string{"--defaults-extra-file=" + mysqlConfigPath()}, base...)
 		}
 		run := func(q string) (string, error) {
 			out, err := runCmdTimeout(ctx, 5*time.Second, bin, append(append([]string{}, base...), "-e", q)...)

@@ -91,7 +91,7 @@ func New(apiURL string, interval time.Duration) *Updater {
 		// No client-wide Timeout (it would cap the binary download); each
 		// request carries its own deadline or stall watchdog instead.
 		client: &http.Client{Transport: updaterTransport()},
-		asset:  "infrapilot-agent-linux-" + runtime.GOARCH,
+		asset:  "opservo-agent-linux-" + runtime.GOARCH,
 	}
 }
 

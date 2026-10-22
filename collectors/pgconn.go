@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// /etc/infrapilot/pg.conf holds ONE libpq connection string — a URI
+// /etc/opservo/pg.conf holds ONE libpq connection string — a URI
 // (postgresql://user:pass@host:5432/db?sslmode=require) or keyword/value
 // pairs (host=… user=… password=… dbname=…). It used to be handed to psql on
 // the command line, which put the password in `ps` for every local user.

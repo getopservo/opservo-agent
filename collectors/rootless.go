@@ -23,7 +23,7 @@ import (
 // would also fail: the socket is 0600), and tag every container with the
 // owning user so the dashboard can say "run by alice".
 //
-// Opt-out: OPSERVO_SKIP_ROOTLESS_DOCKER=true in /etc/infrapilot/config.
+// Opt-out: OPSERVO_SKIP_ROOTLESS_DOCKER=true in /etc/opservo/config.
 
 const rootlessSkipEnv = "OPSERVO_SKIP_ROOTLESS_DOCKER"
 

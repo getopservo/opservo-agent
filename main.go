@@ -16,6 +16,8 @@ import (
 	"github.com/getopservo/opservo-agent/buffer"
 	"github.com/getopservo/opservo-agent/collectors"
 	"github.com/getopservo/opservo-agent/executor"
+	"github.com/getopservo/opservo-agent/migrate"
+	"github.com/getopservo/opservo-agent/paths"
 	"github.com/getopservo/opservo-agent/prober"
 	"github.com/getopservo/opservo-agent/sender"
 	"github.com/getopservo/opservo-agent/shell"
@@ -62,9 +64,9 @@ var (
 // defaultBufferPath returns a per-user location for the agent's SQLite buffer.
 func defaultBufferPath() string {
 	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".infrapilot", "agent-buffer.db")
+		return filepath.Join(home, ".opservo", "agent-buffer.db")
 	}
-	return filepath.Join(os.TempDir(), "infrapilot-agent-buffer.db")
+	return filepath.Join(os.TempDir(), "opservo-agent-buffer.db")
 }
 
 func main() {
@@ -83,6 +85,14 @@ func main() {
 		"interval", *interval,
 		"dev_mode", *devMode,
 	)
+	// A box installed before the rename moves to the current layout on the
+	// first start of this build; the new service then replaces this process.
+	if migrate.Run() {
+		slog.Info("handed over to " + paths.ServiceName + " — waiting to be stopped")
+		time.Sleep(2 * time.Minute)
+		slog.Warn("still running after the hand-over — continuing on the old layout")
+	}
+
 	if flagSetOnCommandLine(flag.CommandLine, "secret-key") {
 		slog.Warn("--secret-key on the command line is visible to every user via ps; set OPSERVO_SECRET_KEY in " +
 			"the environment or the config file instead (the flag will be removed in a future release)")
@@ -99,7 +109,7 @@ func main() {
 	// an image of another server and must NOT reuse its credentials.
 	enrollKey := getEnv("OPSERVO_ENROLL_KEY", "INFRAPILOT_ENROLL_KEY", "")
 	recordedIdentity := getEnv("OPSERVO_MACHINE_ID", "INFRAPILOT_MACHINE_ID", "")
-	configPath := getEnv("OPSERVO_CONFIG_PATH", "INFRAPILOT_CONFIG_PATH", "/etc/infrapilot/config")
+	configPath := getEnv("OPSERVO_CONFIG_PATH", "INFRAPILOT_CONFIG_PATH", paths.ConfigFile("config"))
 	currentIdentity := collectors.InstanceIdentity()
 	if *agentID != "" && isClone(recordedIdentity, currentIdentity) {
 		if enrollKey != "" {
@@ -140,7 +150,7 @@ func main() {
 		slog.Info("Registration successful", "agent_id", id)
 		// The secret key is only echoed in --dev mode against a loopback API: in production logs end up in
 		// journald and log shippers. (The installer persists both values to
-		// /etc/infrapilot/config itself, so a normal install never relies on this.)
+		// /etc/opservo/config itself, so a normal install never relies on this.)
 		if insecureTLS {
 			slog.Info("Add these to your environment to skip registration on restart",
 				"OPSERVO_AGENT_ID", id,

@@ -15,7 +15,7 @@
 #   1. Detects the Linux distro + CPU architecture.
 #   2. Downloads the matching agent binary from the Opservo API (or
 #      OPSERVO_BINARY_BASE) and verifies its Ed25519-signed manifest.
-#   3. Writes /etc/infrapilot/config (API URL + agent credentials).
+#   3. Writes /etc/opservo/config (API URL + agent credentials).
 #   4. Installs a systemd unit that runs on boot and restarts on failure.
 #   5. Starts the agent immediately.
 #   6. Prints the agent ID and a link to the dashboard.
@@ -36,14 +36,11 @@
 #                          (needs OpenSSL 3.x; auto-probes `openssl`/`openssl3`,
 #                          then falls back to a pure-python3 verifier — so old
 #                          hosts like Ubuntu 20.04 need no override at all)
-#   (legacy INFRAPILOT_* variables are still accepted for backward compatibility)
 #
 set -euo pipefail
 
 # ── Configuration (env-overridable) ──────────────────────────────────────────
-# Accept OPSERVO_* (current), falling back to the legacy INFRAPILOT_* names so
-# older install commands / re-installs keep working.
-API_URL="${OPSERVO_API_URL:-${INFRAPILOT_API_URL:-https://api.getopservo.com}}"
+API_URL="${OPSERVO_API_URL:-https://api.getopservo.com}"
 # Refuse a manually-overridden http:// API URL — the agent's secret key and
 # every heartbeat would go over plaintext. Only http://localhost/127.0.0.1 is
 # allowed, for local dev against a non-TLS API.
@@ -61,18 +58,18 @@ case "${API_URL}" in
 esac
 # If the dashboard URL is not given, derive it from the API URL (drop an "-api"
 # or "api." from the host), so the printed link points at the real dashboard.
-DASHBOARD_URL="${OPSERVO_DASHBOARD_URL:-${INFRAPILOT_DASHBOARD_URL:-}}"
+DASHBOARD_URL="${OPSERVO_DASHBOARD_URL:-}"
 if [ -z "${DASHBOARD_URL}" ]; then
   DASHBOARD_URL="$(printf '%s' "${API_URL}" | sed -E 's#-api\.#.#; s#//api\.#//#')"
 fi
-VERSION="${OPSERVO_VERSION:-${INFRAPILOT_VERSION:-latest}}"
-TENANT_ID="${OPSERVO_TENANT_ID:-${INFRAPILOT_TENANT_ID:-}}"
-ENROLLMENT_TOKEN="${OPSERVO_TOKEN:-${INFRAPILOT_TOKEN:-}}"   # from the dashboard "Add New Server" flow
+VERSION="${OPSERVO_VERSION:-latest}"
+TENANT_ID="${OPSERVO_TENANT_ID:-}"
+ENROLLMENT_TOKEN="${OPSERVO_TOKEN:-}"   # from the dashboard "Add New Server" flow
 PROMPT_TOKEN=0   # --prompt: read the token from the terminal instead of the environment
-FORCE="${OPSERVO_FORCE:-${INFRAPILOT_FORCE:-0}}"
-UNINSTALL="${OPSERVO_UNINSTALL:-${INFRAPILOT_UNINSTALL:-0}}"  # set to 1 to remove the agent instead
+FORCE="${OPSERVO_FORCE:-0}"
+UNINSTALL="${OPSERVO_UNINSTALL:-0}"  # set to 1 to remove the agent instead
 
-BINARY_NAME="infrapilot-agent"
+BINARY_NAME="opservo-agent"
 INSTALL_PATH="/usr/local/bin/${BINARY_NAME}"
 # Ed25519 public key (hex) that signs the update manifest. Must match
 # agent/updater/updater.go:signingPublicKeyHex. When set, the installer REFUSES
@@ -80,11 +77,20 @@ INSTALL_PATH="/usr/local/bin/${BINARY_NAME}"
 # distribution server alone can't push a trojanised agent (it lacks the offline
 # signing key). Empty = signature checking disabled (legacy behaviour).
 AGENT_SIGNING_PUBKEY="${OPSERVO_SIGNING_PUBKEY:-b7f1a9b29bd8ea7982a3e21b39a119ca4dbdfd065cf7bcdba486487d0bb0bc76}"
-CONFIG_DIR="/etc/infrapilot"
+CONFIG_DIR="/etc/opservo"
 CONFIG_FILE="${CONFIG_DIR}/config"
-UNIT_FILE="/etc/systemd/system/infrapilot-agent.service"
-STATE_DIR="/var/lib/infrapilot"
+SERVICE_NAME="opservo-agent.service"
+UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}"
+STATE_DIR="/var/lib/opservo"
 BUFFER_PATH="${STATE_DIR}/agent-buffer.db"
+# Layout of installs made before the rename (must match agent/paths). A
+# re-install adopts it (adopt_legacy_install); the agent itself moves over on
+# its first self-update (agent/migrate). Remove once no box reports from it.
+LEGACY_CONFIG_DIR="/etc/infrapilot"
+LEGACY_STATE_DIR="/var/lib/infrapilot"
+LEGACY_BINARY="/usr/local/bin/infrapilot-agent"
+LEGACY_SERVICE_NAME="infrapilot-agent.service"
+LEGACY_UNIT_FILE="/etc/systemd/system/${LEGACY_SERVICE_NAME}"
 
 TMP_DIR=""
 cleanup() { [ -n "${TMP_DIR}" ] && rm -rf "${TMP_DIR}" 2>/dev/null || true; }
@@ -184,7 +190,7 @@ openssl_can_verify_ed25519() {
 pick_openssl() {
   # NOTE: runs inside $(…), so warn (stderr) is visible but fail would only
   # kill the subshell — the caller does the actual fail.
-  local override="${OPSERVO_OPENSSL_BIN:-${INFRAPILOT_OPENSSL_BIN:-}}"
+  local override="${OPSERVO_OPENSSL_BIN:-}"
   if [ -n "${override}" ]; then
     if ! command -v "${override}" >/dev/null 2>&1; then
       warn "OPSERVO_OPENSSL_BIN is set to '${override}' but it was not found."
@@ -365,7 +371,7 @@ download_binary() {
   # By default the binary is served by the Opservo API itself (no GitHub
   # access needed). Override OPSERVO_BINARY_BASE to fetch from elsewhere, or
   # set it to a GitHub releases URL.
-  local binary_base="${OPSERVO_BINARY_BASE:-${INFRAPILOT_BINARY_BASE:-${API_URL%/}/download}}"
+  local binary_base="${OPSERVO_BINARY_BASE:-${API_URL%/}/download}"
   local url="${binary_base}/${asset}"
 
   TMP_DIR="$(mktemp -d)"
@@ -489,10 +495,10 @@ register_agent() {
 }
 
 resolve_credentials() {
-  # 1. Pre-provisioned via environment (OPSERVO_*, legacy INFRAPILOT_* fallback).
+  # 1. Pre-provisioned via environment.
   local env_id env_key
-  env_id="${OPSERVO_AGENT_ID:-${INFRAPILOT_AGENT_ID:-}}"
-  env_key="${OPSERVO_SECRET_KEY:-${INFRAPILOT_SECRET_KEY:-}}"
+  env_id="${OPSERVO_AGENT_ID:-}"
+  env_key="${OPSERVO_SECRET_KEY:-}"
   if [ -n "${env_id}" ] && [ -n "${env_key}" ]; then
     AGENT_ID="${env_id}"
     SECRET_KEY="${env_key}"
@@ -500,13 +506,12 @@ resolve_credentials() {
     return
   fi
 
-  # 2. Reuse existing config (idempotent re-install / upgrade). Read the current
-  # OPSERVO_* keys, falling back to a legacy INFRAPILOT_* config so old boxes
-  # keep their identity across the rename.
+  # 2. Reuse existing config (idempotent re-install / upgrade). A pre-rename
+  # config was already carried over by adopt_legacy_install.
   if [ "${FORCE}" != "1" ]; then
     local existing_id existing_key
-    existing_id="$(config_value OPSERVO_AGENT_ID)";  [ -z "${existing_id}" ]  && existing_id="$(config_value INFRAPILOT_AGENT_ID)"
-    existing_key="$(config_value OPSERVO_SECRET_KEY)"; [ -z "${existing_key}" ] && existing_key="$(config_value INFRAPILOT_SECRET_KEY)"
+    existing_id="$(config_value OPSERVO_AGENT_ID)"
+    existing_key="$(config_value OPSERVO_SECRET_KEY)"
     if [ -n "${existing_id}" ] && [ -n "${existing_key}" ]; then
       case "${ENROLLMENT_TOKEN}" in
         ipk_*)
@@ -558,7 +563,7 @@ resolve_credentials() {
           # 404s forever and the server silently drops out of BOTH dashboards.
           # Refuse instead and leave the working config untouched.
           local existing_url
-          existing_url="$(config_value OPSERVO_API_URL)"; [ -z "${existing_url}" ] && existing_url="$(config_value INFRAPILOT_API_URL)"
+          existing_url="$(config_value OPSERVO_API_URL)"
           if [ -n "${existing_url}" ] && [ "${existing_url%/}" != "${API_URL%/}" ]; then
             printf '\n%s%sThis server is currently registered with %s, not %s.%s\n' "${C_BOLD}" "${C_YELLOW}" "${existing_url}" "${API_URL}" "${C_RESET}" >&2
             printf '  Registering it with %s failed (%s), and its existing credentials are\n' "${API_URL}" "${REGISTER_ERROR:-rejected}" >&2
@@ -599,7 +604,7 @@ write_config() {
     shell_opt="true"
   fi
   # Nor may it drop a local kill-switch (OPSERVO_ENABLE_ACTIONS=false,
-  # OPSERVO_AUTO_UPDATE=false) or any other OPSERVO_*/INFRAPILOT_* line the
+  # OPSERVO_AUTO_UPDATE=false) or any other OPSERVO_* line the
   # operator added by hand: every existing key the template does not set this
   # run is carried over verbatim, after the template, and named on the way.
   local preserved="" preserved_keys="" line key
@@ -612,7 +617,7 @@ write_config() {
     preserved="${preserved}
 ${line}"
     preserved_keys="${preserved_keys}${preserved_keys:+ }${key}"
-  done < <($SUDO grep -E '^(OPSERVO|INFRAPILOT)_[A-Z0-9_]+=' "${CONFIG_FILE}" 2>/dev/null || true)
+  done < <($SUDO grep -E '^OPSERVO_[A-Z0-9_]+=' "${CONFIG_FILE}" 2>/dev/null || true)
   # Recorded identity lets the agent detect AMI/template clones at startup.
   local identity extra
   identity="$(instance_identity)"
@@ -635,12 +640,12 @@ OPSERVO_SECRET_KEY=${SECRET_KEY}
 OPSERVO_BUFFER_PATH=${BUFFER_PATH}
 # Opt-in: run dashboard-assigned private-network TCP uptime checks from this
 # server (e.g. probe an internal RDS endpoint). Set to true, then:
-#   systemctl restart infrapilot-agent
+#   systemctl restart opservo-agent
 OPSERVO_ENABLE_PROBES=${probes}
 # Opt-in: allow live terminal sessions opened from the dashboard (owners and
 # admins, identity check every time, recorded). The server's switch in the
 # dashboard must be on too. Set to true, then:
-#   systemctl restart infrapilot-agent
+#   systemctl restart opservo-agent
 OPSERVO_ENABLE_SHELL=${shell_opt}
 ${extra}${preserved}
 EOF
@@ -668,7 +673,7 @@ ExecStart=${INSTALL_PATH}
 Restart=always
 RestartSec=5
 # Persistent local buffer for the 24h offline store.
-StateDirectory=infrapilot
+StateDirectory=opservo
 # Hardening that does not interfere with collection OR with the opt-in remote
 # actions (dispatched fixes run as children of this unit, so anything that
 # would block sysctl/modprobe/cgroup/mount changes or hide /tmp is left off
@@ -719,19 +724,19 @@ ensure_gpu_tools() {
 # ── Step 5: start the agent ───────────────────────────────────────────────────
 start_agent() {
   $SUDO systemctl daemon-reload
-  $SUDO systemctl enable infrapilot-agent.service >/dev/null 2>&1 || true
-  $SUDO systemctl restart infrapilot-agent.service
+  $SUDO systemctl enable ${SERVICE_NAME} >/dev/null 2>&1 || true
+  $SUDO systemctl restart ${SERVICE_NAME}
 
   # Give it a moment, then confirm it is actually running.
   local i
   for i in 1 2 3 4 5; do
-    if $SUDO systemctl is-active --quiet infrapilot-agent.service; then
+    if $SUDO systemctl is-active --quiet ${SERVICE_NAME}; then
       success "Agent is running and enabled on boot."
       return
     fi
     sleep 1
   done
-  warn "The agent did not report active yet. Check: journalctl -u infrapilot-agent -n 50"
+  warn "The agent did not report active yet. Check: journalctl -u opservo-agent -n 50"
 }
 
 # ── Step 6: summary ───────────────────────────────────────────────────────────
@@ -740,24 +745,77 @@ print_summary() {
   printf '  Agent ID:  %s%s%s\n' "${C_BOLD}" "${AGENT_ID}" "${C_RESET}"
   printf '  Dashboard: %s%s/servers/%s%s\n' "${C_BOLD}" "${DASHBOARD_URL%/}" "${AGENT_ID}" "${C_RESET}"
   printf '\nManage the agent with:\n'
-  printf '  systemctl status infrapilot-agent\n'
-  printf '  journalctl -u infrapilot-agent -f\n'
+  printf '  systemctl status opservo-agent\n'
+  printf '  journalctl -u opservo-agent -f\n'
   printf '\nOptional: to monitor MySQL, create a read-only user and put its login in\n'
   printf '  %s/mysql.cnf  (a [client] option file). The agent reads only that file.\n\n' "${CONFIG_DIR}"
+}
+
+# ── Pre-rename installs ───────────────────────────────────────────────────────
+# remove_legacy_install stops and deletes an install in the pre-rename layout.
+remove_legacy_install() {
+  if [ -d /run/systemd/system ] && [ -f "${LEGACY_UNIT_FILE}" ]; then
+    $SUDO systemctl stop "${LEGACY_SERVICE_NAME}" 2>/dev/null || true
+    $SUDO systemctl disable "${LEGACY_SERVICE_NAME}" 2>/dev/null || true
+  fi
+  $SUDO rm -rf "${LEGACY_UNIT_FILE}" "${LEGACY_UNIT_FILE}.d" "${LEGACY_BINARY}" "${LEGACY_CONFIG_DIR}" "${LEGACY_STATE_DIR}"
+  [ -d /run/systemd/system ] && $SUDO systemctl daemon-reload 2>/dev/null || true
+}
+
+# adopt_legacy_install: a re-install on a box still in the pre-rename layout
+# carries its config (identity, opt-ins, mysql.cnf / pg.conf), its local
+# buffer and any unit drop-ins over to the current layout, then removes the
+# old service, so the box keeps its agent ID and runs one agent, not two.
+adopt_legacy_install() {
+  [ -f "${LEGACY_CONFIG_DIR}/config" ] || return 0
+  if [ -f "${CONFIG_FILE}" ]; then
+    remove_legacy_install
+    return 0
+  fi
+  info "Moving the existing agent install from ${LEGACY_CONFIG_DIR} to ${CONFIG_DIR}…"
+  $SUDO mkdir -p "${CONFIG_DIR}"
+  $SUDO chmod 0755 "${CONFIG_DIR}"
+  $SUDO cp -a "${LEGACY_CONFIG_DIR}/." "${CONFIG_DIR}/"
+  # Rename legacy INFRAPILOT_* keys unless the OPSERVO_* one is already set, and
+  # point paths at the new layout.
+  local line key out=""
+  while IFS= read -r line || [ -n "${line}" ]; do
+    case "${line}" in
+      INFRAPILOT_*=*)
+        key="OPSERVO_${line#INFRAPILOT_}"; key="${key%%=*}"
+        if $SUDO grep -q "^${key}=" "${LEGACY_CONFIG_DIR}/config"; then continue; fi
+        line="OPSERVO_${line#INFRAPILOT_}" ;;
+    esac
+    out="${out}${line}
+"
+  done < <($SUDO cat "${LEGACY_CONFIG_DIR}/config")
+  printf '%s' "${out}" | sed -e "s#${LEGACY_CONFIG_DIR}#${CONFIG_DIR}#g" -e "s#${LEGACY_STATE_DIR}#${STATE_DIR}#g" -e 's#infrapilot-agent#opservo-agent#g' \
+    | write_file "${CONFIG_FILE}" 0600
+  if [ -d "${LEGACY_STATE_DIR}" ]; then
+    $SUDO mkdir -p "${STATE_DIR}"
+    $SUDO cp -a "${LEGACY_STATE_DIR}/." "${STATE_DIR}/"
+  fi
+  if [ -d "${LEGACY_UNIT_FILE}.d" ]; then
+    $SUDO mkdir -p "${UNIT_FILE}.d"
+    $SUDO cp -a "${LEGACY_UNIT_FILE}.d/." "${UNIT_FILE}.d/"
+  fi
+  remove_legacy_install
+  success "Moved the existing install to ${CONFIG_DIR} (same agent ID)."
 }
 
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 uninstall() {
   printf '%s%sRemoving Opservo agent%s\n\n' "${C_BLUE}" "${C_BOLD}" "${C_RESET}"
   if [ -d /run/systemd/system ]; then
-    $SUDO systemctl stop infrapilot-agent.service 2>/dev/null || true
-    $SUDO systemctl disable infrapilot-agent.service 2>/dev/null || true
+    $SUDO systemctl stop ${SERVICE_NAME} 2>/dev/null || true
+    $SUDO systemctl disable ${SERVICE_NAME} 2>/dev/null || true
     $SUDO rm -f "${UNIT_FILE}"
     $SUDO systemctl daemon-reload 2>/dev/null || true
   fi
   $SUDO rm -f "${INSTALL_PATH}"
   $SUDO rm -rf "${CONFIG_DIR}"
   $SUDO rm -rf "${STATE_DIR}"
+  remove_legacy_install
   success "Opservo agent removed from this server."
 }
 
@@ -820,6 +878,7 @@ main() {
   fi
   detect_platform
   download_binary
+  adopt_legacy_install
   resolve_credentials
   write_config
   ensure_gpu_tools

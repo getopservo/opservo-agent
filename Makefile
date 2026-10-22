@@ -1,6 +1,5 @@
-# Binary name the API serves and the installer installs (kept for existing
-# installs). VERSION comes from git unless given: make build VERSION=1.2.3
-BINARY=infrapilot-agent
+# Binary name the API serves and the installer installs. VERSION comes from git unless given: make build VERSION=1.2.3
+BINARY=opservo-agent
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 # Release build: the flags and the digest-pinned Go toolchain of the official

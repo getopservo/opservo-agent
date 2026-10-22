@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/getopservo/opservo-agent/paths"
 )
 
 // PostgresStat is one PostgreSQL instance's health + configuration facts,
@@ -58,7 +60,7 @@ type PostgresBloat struct {
 
 // PostgresInfo: per-instance PostgreSQL facts. Credential-respecting like the
 // MySQL collector: the host path runs psql as the local `postgres` OS user
-// (peer auth), or uses the operator's OWN /etc/infrapilot/pg.conf — a single
+// (peer auth), or uses the operator's OWN /etc/opservo/pg.conf — a single
 // libpq connection URI/keywords line pointing at a read-only monitoring role
 // (works for a private RDS reachable from this box). The agent never reads
 // the application's .env.
@@ -72,7 +74,7 @@ type PostgresCollector struct{}
 func NewPostgresCollector() *PostgresCollector { return &PostgresCollector{} }
 func (p *PostgresCollector) Name() string      { return "postgres" }
 
-const pgConfigPath = "/etc/infrapilot/pg.conf"
+func pgConfigPath() string { return paths.ConfigFile("pg.conf") }
 
 var pgContainerRe = regexp.MustCompile(`(?i)postgres|timescale|pgvector|supabase|pgsql`)
 
@@ -134,10 +136,10 @@ func (p *PostgresCollector) Collect(ctx context.Context) (interface{}, error) {
 	// The connection string is passed to psql as libpq PG* environment
 	// variables, never on argv (the password would show in `ps` otherwise —
 	// see pgconn.go). An unparseable line is skipped, never fed to argv.
-	if conn, err := os.ReadFile(pgConfigPath); err == nil {
+	if conn, err := os.ReadFile(pgConfigPath()); err == nil {
 		if line := strings.TrimSpace(firstNonCommentLine(string(conn))); line != "" && hasBinary("psql") {
 			if env, perr := pgConnEnv(line); perr != nil {
-				slog.Warn("postgres collector: ignoring "+pgConfigPath, "error", perr)
+				slog.Warn("postgres collector: ignoring "+pgConfigPath(), "error", perr)
 			} else {
 				run := func(_ string, sql string) (string, error) { // connection already names the DB
 					out, err := runCmdEnvTimeout(ctx, 6*time.Second, env, "psql", psqlArgs("", sql)...)

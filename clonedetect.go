@@ -2,7 +2,7 @@ package main
 
 // AMI-clone detection. The installer records the machine's identity
 // (collectors.InstanceIdentity(): EC2 instance-id → DMI asset tag →
-// machine-id) as OPSERVO_MACHINE_ID in /etc/infrapilot/config. If a box is
+// machine-id) as OPSERVO_MACHINE_ID in /etc/opservo/config. If a box is
 // baked into an AMI and launched again — an Auto Scaling group, or a manual
 // clone — the new instance boots with the ORIGINAL server's credentials but a
 // DIFFERENT identity. Without this check every clone would report as the same

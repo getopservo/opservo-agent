@@ -9,7 +9,7 @@ func TestTopProcessesKeepsSelf(t *testing.T) {
 	for i := 1; i <= 50; i++ {
 		procs = append(procs, ProcessInfo{PID: int32(i), Name: "busy", CPU: float64(100 - i), MemMB: 10})
 	}
-	procs = append(procs, ProcessInfo{PID: 999, Name: "infrapilot-agent", CPU: 0.1, MemMB: 28})
+	procs = append(procs, ProcessInfo{PID: 999, Name: "opservo-agent", CPU: 0.1, MemMB: 28})
 
 	got := topProcesses(procs, 999, 40)
 	if len(got) != 41 {

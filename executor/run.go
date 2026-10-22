@@ -2,7 +2,7 @@
 //
 // SECURITY: this reverses the agent's historical read-only guarantee and is
 // therefore OPT-IN and OFF BY DEFAULT. main.go only starts the executor when
-// the operator passes --enable-actions / INFRAPILOT_ENABLE_ACTIONS=true on the
+// the operator passes --enable-actions / OPSERVO_ENABLE_ACTIONS=true on the
 // server itself, so deploying a build that contains this package does not make
 // any existing server remotely executable. Commands are pulled over the agent's
 // existing outbound HTTPS connection (no inbound port) and the pending/result

@@ -31,7 +31,7 @@ func TestVerifyManifestSignature(t *testing.T) {
 		t.Fatal(err)
 	}
 	pubHex := hex.EncodeToString(pub)
-	manifest := []byte(`{"infrapilot-agent-linux-amd64":"deadbeef"}`)
+	manifest := []byte(`{"opservo-agent-linux-amd64":"deadbeef"}`)
 	goodSig := hex.EncodeToString(ed25519.Sign(priv, manifest))
 
 	if err := verifyManifestSignature(pubHex, manifest, goodSig); err != nil {
@@ -39,7 +39,7 @@ func TestVerifyManifestSignature(t *testing.T) {
 	}
 
 	// Tampered manifest — same signature must NOT verify.
-	if err := verifyManifestSignature(pubHex, []byte(`{"infrapilot-agent-linux-amd64":"eviii"}`), goodSig); err == nil {
+	if err := verifyManifestSignature(pubHex, []byte(`{"opservo-agent-linux-amd64":"eviii"}`), goodSig); err == nil {
 		t.Error("tampered manifest accepted — signature check is not enforced")
 	}
 
@@ -61,8 +61,8 @@ func TestVerifyManifestSignature(t *testing.T) {
 
 func TestNeedsUpdate(t *testing.T) {
 	manifest := map[string]string{
-		"infrapilot-agent-linux-amd64": "aaa111",
-		"infrapilot-agent-linux-arm64": "bbb222",
+		"opservo-agent-linux-amd64": "aaa111",
+		"opservo-agent-linux-arm64": "bbb222",
 	}
 	tests := []struct {
 		name     string
@@ -71,10 +71,10 @@ func TestNeedsUpdate(t *testing.T) {
 		wantSha  string
 		wantBool bool
 	}{
-		{"up to date", "aaa111", "infrapilot-agent-linux-amd64", "aaa111", false},
-		{"new build available", "old999", "infrapilot-agent-linux-amd64", "aaa111", true},
-		{"different arch matched", "old999", "infrapilot-agent-linux-arm64", "bbb222", true},
-		{"asset not advertised", "old999", "infrapilot-agent-linux-riscv", "", false},
+		{"up to date", "aaa111", "opservo-agent-linux-amd64", "aaa111", false},
+		{"new build available", "old999", "opservo-agent-linux-amd64", "aaa111", true},
+		{"different arch matched", "old999", "opservo-agent-linux-arm64", "bbb222", true},
+		{"asset not advertised", "old999", "opservo-agent-linux-riscv", "", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -94,7 +94,7 @@ func TestNew_DefaultsAndAsset(t *testing.T) {
 	if u.apiURL != "https://api.example.test" {
 		t.Errorf("trailing slash not trimmed: %q", u.apiURL)
 	}
-	if u.asset == "" || u.asset[:23] != "infrapilot-agent-linux-" {
+	if u.asset == "" || u.asset[:20] != "opservo-agent-linux-" {
 		t.Errorf("unexpected asset name: %q", u.asset)
 	}
 }
@@ -119,7 +119,7 @@ func TestCheckManifestFreshness(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			m := map[string]string{"infrapilot-agent-linux-amd64": "abc"}
+			m := map[string]string{"opservo-agent-linux-amd64": "abc"}
 			if c.gen != "" {
 				m["generated_at"] = c.gen
 			}

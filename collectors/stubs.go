@@ -241,7 +241,7 @@ func probeHTTPStatuses(ports []ListeningPort) map[uint32]int {
 			if err != nil {
 				return
 			}
-			req.Header.Set("User-Agent", "infrapilot-agent/health")
+			req.Header.Set("User-Agent", "opservo-agent/health")
 			resp, err := client.Do(req)
 			if err != nil {
 				return // connection refused / not HTTP / timeout → no entry
