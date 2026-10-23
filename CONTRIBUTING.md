@@ -4,7 +4,7 @@ Thanks for taking the time to help. Everyone taking part follows the
 [Code of Conduct](CODE_OF_CONDUCT.md).
 
 - **Bugs and ideas:** open a GitHub issue. Say what you ran, what you expected,
-  and what happened. Agent logs (`journalctl -u infrapilot-agent`) help.
+  and what happened. Agent logs (`journalctl -u opservo-agent`) help.
 - **Security issues:** do not open an issue — see [SECURITY.md](SECURITY.md).
 - **Pull requests:** keep them small and focused. Before opening one, run:
 

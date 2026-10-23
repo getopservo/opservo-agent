@@ -39,8 +39,8 @@ What the agent does **not** do:
 
 - It never reads application `.env` files or other application secrets.
   Database facts use local socket / peer authentication, or a monitoring
-  credential file you create yourself (`/etc/infrapilot/mysql.cnf`,
-  `/etc/infrapilot/pg.conf`).
+  credential file you create yourself (`/etc/opservo/mysql.cnf`,
+  `/etc/opservo/pg.conf`).
 - It opens no inbound ports. All traffic is outbound HTTPS to the API.
 
 Secrets in log lines are masked on the host before anything is buffered or
@@ -56,7 +56,7 @@ recognise can still get through, so don't log secrets.
 
 - **Registration.** On first start the agent registers with an enrollment
   token from the dashboard and receives an agent ID and a secret key, stored in
-  `/etc/infrapilot/config`.
+  `/etc/opservo/config`.
 - **Heartbeats.** Each payload is HMAC-SHA256 signed with the agent's secret
   key (`X-Agent-ID`, `X-Signature`, `X-Timestamp` headers). The API rejects
   unsigned or wrongly signed payloads.
@@ -88,7 +88,7 @@ service". How this is controlled:
   or any `OPSERVO_ENABLE_*` switch, so the local switches below cannot be
   flipped over the command channel. This is a text guard, not a sandbox.
 - **To turn command polling off completely on a host**, set
-  `OPSERVO_ENABLE_ACTIONS=false` in `/etc/infrapilot/config` (or pass
+  `OPSERVO_ENABLE_ACTIONS=false` in `/etc/opservo/config` (or pass
   `--enable-actions=false`) and restart the agent. The agent then never asks
   for commands, whatever the dashboard says.
 
@@ -98,7 +98,7 @@ The dashboard can open an interactive shell (a real PTY, for `top`, `vim`,
 prompts) on a server. This is **off by default on the host** and needs two
 switches: the server's live terminal must be turned on in the dashboard by an
 owner or admin, **and** `OPSERVO_ENABLE_SHELL=true` must be set in
-`/etc/infrapilot/config` (or `--enable-shell`). `OPSERVO_ENABLE_ACTIONS=false`
+`/etc/opservo/config` (or `--enable-shell`). `OPSERVO_ENABLE_ACTIONS=false`
 also disables it. How it works:
 
 - Each session start is Ed25519-signed by the API (session id, agent, user,
@@ -132,15 +132,13 @@ curl -sSL https://api.getopservo.com/install.sh | sudo env OPSERVO_TOKEN=<token>
 
 `install.sh` in this repository is that installer. It detects the CPU
 architecture, downloads the binary, verifies the signed manifest (see below),
-writes `/etc/infrapilot/config`, and installs the `infrapilot-agent` systemd
-unit. (The `infrapilot` names are from the product's earlier name and are kept
-so existing installs keep working.)
+writes `/etc/opservo/config`, and installs the `opservo-agent` systemd unit.
 
 Useful commands after install:
 
 ```bash
-systemctl status infrapilot-agent
-journalctl -u infrapilot-agent -f
+systemctl status opservo-agent
+journalctl -u opservo-agent -f
 ```
 
 ### Kubernetes
@@ -166,8 +164,7 @@ Cross-compile with `make build-all`. Run against a local API with:
 go run . --dev --api-url http://localhost:3001
 ```
 
-Main flags (each has an environment variable; legacy `INFRAPILOT_*` names are
-also accepted):
+Main flags (each has an environment variable):
 
 | Flag | Env | Default |
 |------|-----|---------|
@@ -178,7 +175,7 @@ also accepted):
 | `--enable-probes` | `OPSERVO_ENABLE_PROBES` | `false` |
 | `--enable-shell` | `OPSERVO_ENABLE_SHELL` | `false` (see "Live terminal") |
 | `--auto-update` | `OPSERVO_AUTO_UPDATE` | `true` |
-| `--buffer-path` | `OPSERVO_BUFFER_PATH` | `~/.infrapilot/agent-buffer.db` (`/root/.infrapilot/…` under the installed unit) |
+| `--buffer-path` | `OPSERVO_BUFFER_PATH` | `~/.opservo/agent-buffer.db` (`/var/lib/opservo/agent-buffer.db` under the installed unit) |
 | `--interval` | | `60s` |
 | `--dev` | | off (verbose logs; skips TLS verification only for a loopback API URL — local development only) |
 

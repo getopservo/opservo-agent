@@ -9,9 +9,9 @@ import "regexp"
 // The API refuses the same commands (api/src/lib/agentSelfProtect.ts) — keep
 // the lists identical. A guard against the obvious path, not a sandbox.
 var selfProtectPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)/etc/(?:infrapilot|opservo)/config\b`),
-	regexp.MustCompile(`(?i)/etc/systemd/system/(?:infrapilot|opservo)-agent`),
-	regexp.MustCompile(`(?i)systemctl\s+(?:--?[\w-]+\s+)*edit\s+(?:--?[\w-]+\s+)*(?:infrapilot|opservo)-agent`),
+	regexp.MustCompile(`(?i)/etc/opservo/config\b`),
+	regexp.MustCompile(`(?i)/etc/systemd/system/opservo-agent`),
+	regexp.MustCompile(`(?i)systemctl\s+(?:--?[\w-]+\s+)*edit\s+(?:--?[\w-]+\s+)*opservo-agent`),
 	regexp.MustCompile(`(?i)ENABLE_(?:SHELL|ACTIONS|PROBES)\b`),
 	regexp.MustCompile(`(?i)--?enable-(?:shell|actions|probes)\b`),
 }
