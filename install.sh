@@ -83,6 +83,14 @@ SERVICE_NAME="opservo-agent.service"
 UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}"
 STATE_DIR="/var/lib/opservo"
 BUFFER_PATH="${STATE_DIR}/agent-buffer.db"
+# Layout of installs made before the rename (must match agent/paths). A
+# re-install adopts it (adopt_legacy_install); the agent itself moves over on
+# its first self-update (agent/migrate). Remove once no box reports from it.
+LEGACY_CONFIG_DIR="/etc/infrapilot"
+LEGACY_STATE_DIR="/var/lib/infrapilot"
+LEGACY_BINARY="/usr/local/bin/infrapilot-agent"
+LEGACY_SERVICE_NAME="infrapilot-agent.service"
+LEGACY_UNIT_FILE="/etc/systemd/system/${LEGACY_SERVICE_NAME}"
 
 TMP_DIR=""
 cleanup() { [ -n "${TMP_DIR}" ] && rm -rf "${TMP_DIR}" 2>/dev/null || true; }
@@ -498,7 +506,8 @@ resolve_credentials() {
     return
   fi
 
-  # 2. Reuse existing config (idempotent re-install / upgrade).
+  # 2. Reuse existing config (idempotent re-install / upgrade). A pre-rename
+  # config was already carried over by adopt_legacy_install.
   if [ "${FORCE}" != "1" ]; then
     local existing_id existing_key
     existing_id="$(config_value OPSERVO_AGENT_ID)"
@@ -742,6 +751,58 @@ print_summary() {
   printf '  %s/mysql.cnf  (a [client] option file). The agent reads only that file.\n\n' "${CONFIG_DIR}"
 }
 
+# ── Pre-rename installs ───────────────────────────────────────────────────────
+# remove_legacy_install stops and deletes an install in the pre-rename layout.
+remove_legacy_install() {
+  if [ -d /run/systemd/system ] && [ -f "${LEGACY_UNIT_FILE}" ]; then
+    $SUDO systemctl stop "${LEGACY_SERVICE_NAME}" 2>/dev/null || true
+    $SUDO systemctl disable "${LEGACY_SERVICE_NAME}" 2>/dev/null || true
+  fi
+  $SUDO rm -rf "${LEGACY_UNIT_FILE}" "${LEGACY_UNIT_FILE}.d" "${LEGACY_BINARY}" "${LEGACY_CONFIG_DIR}" "${LEGACY_STATE_DIR}"
+  [ -d /run/systemd/system ] && $SUDO systemctl daemon-reload 2>/dev/null || true
+}
+
+# adopt_legacy_install: a re-install on a box still in the pre-rename layout
+# carries its config (identity, opt-ins, mysql.cnf / pg.conf), its local
+# buffer and any unit drop-ins over to the current layout, then removes the
+# old service, so the box keeps its agent ID and runs one agent, not two.
+adopt_legacy_install() {
+  [ -f "${LEGACY_CONFIG_DIR}/config" ] || return 0
+  if [ -f "${CONFIG_FILE}" ]; then
+    remove_legacy_install
+    return 0
+  fi
+  info "Moving the existing agent install from ${LEGACY_CONFIG_DIR} to ${CONFIG_DIR}…"
+  $SUDO mkdir -p "${CONFIG_DIR}"
+  $SUDO chmod 0755 "${CONFIG_DIR}"
+  $SUDO cp -a "${LEGACY_CONFIG_DIR}/." "${CONFIG_DIR}/"
+  # Rename legacy INFRAPILOT_* keys unless the OPSERVO_* one is already set, and
+  # point paths at the new layout.
+  local line key out=""
+  while IFS= read -r line || [ -n "${line}" ]; do
+    case "${line}" in
+      INFRAPILOT_*=*)
+        key="OPSERVO_${line#INFRAPILOT_}"; key="${key%%=*}"
+        if $SUDO grep -q "^${key}=" "${LEGACY_CONFIG_DIR}/config"; then continue; fi
+        line="OPSERVO_${line#INFRAPILOT_}" ;;
+    esac
+    out="${out}${line}
+"
+  done < <($SUDO cat "${LEGACY_CONFIG_DIR}/config")
+  printf '%s' "${out}" | sed -e "s#${LEGACY_CONFIG_DIR}#${CONFIG_DIR}#g" -e "s#${LEGACY_STATE_DIR}#${STATE_DIR}#g" -e 's#infrapilot-agent#opservo-agent#g' \
+    | write_file "${CONFIG_FILE}" 0600
+  if [ -d "${LEGACY_STATE_DIR}" ]; then
+    $SUDO mkdir -p "${STATE_DIR}"
+    $SUDO cp -a "${LEGACY_STATE_DIR}/." "${STATE_DIR}/"
+  fi
+  if [ -d "${LEGACY_UNIT_FILE}.d" ]; then
+    $SUDO mkdir -p "${UNIT_FILE}.d"
+    $SUDO cp -a "${LEGACY_UNIT_FILE}.d/." "${UNIT_FILE}.d/"
+  fi
+  remove_legacy_install
+  success "Moved the existing install to ${CONFIG_DIR} (same agent ID)."
+}
+
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 uninstall() {
   printf '%s%sRemoving Opservo agent%s\n\n' "${C_BLUE}" "${C_BOLD}" "${C_RESET}"
@@ -754,6 +815,7 @@ uninstall() {
   $SUDO rm -f "${INSTALL_PATH}"
   $SUDO rm -rf "${CONFIG_DIR}"
   $SUDO rm -rf "${STATE_DIR}"
+  remove_legacy_install
   success "Opservo agent removed from this server."
 }
 
@@ -816,6 +878,7 @@ main() {
   fi
   detect_platform
   download_binary
+  adopt_legacy_install
   resolve_credentials
   write_config
   ensure_gpu_tools

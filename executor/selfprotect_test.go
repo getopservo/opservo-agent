@@ -15,6 +15,9 @@ func TestTouchesAgentSwitches(t *testing.T) {
 		"export OPSERVO_ENABLE_ACTIONS=true",
 		"OPSERVO_ENABLE_PROBES=true",
 		"/usr/local/bin/opservo-agent --enable-shell",
+		// Pre-rename layout, still on boxes that have not migrated.
+		"sudo cat /etc/infrapilot/config",
+		"sudo systemctl edit infrapilot-agent",
 	}
 	allowed := []string{
 		"sudo systemctl restart opservo-agent",

@@ -16,6 +16,7 @@ import (
 	"github.com/getopservo/opservo-agent/buffer"
 	"github.com/getopservo/opservo-agent/collectors"
 	"github.com/getopservo/opservo-agent/executor"
+	"github.com/getopservo/opservo-agent/migrate"
 	"github.com/getopservo/opservo-agent/paths"
 	"github.com/getopservo/opservo-agent/prober"
 	"github.com/getopservo/opservo-agent/sender"
@@ -27,37 +28,37 @@ import (
 var version = "dev"
 
 var (
-	apiURL  = flag.String("api-url", getEnv("OPSERVO_API_URL", "https://api.getopservo.com"), "Opservo API URL")
-	agentID = flag.String("agent-id", getEnv("OPSERVO_AGENT_ID", ""), "Agent ID (assigned at registration)")
+	apiURL  = flag.String("api-url", getEnv("OPSERVO_API_URL", "INFRAPILOT_API_URL", "https://api.getopservo.com"), "Opservo API URL")
+	agentID = flag.String("agent-id", getEnv("OPSERVO_AGENT_ID", "INFRAPILOT_AGENT_ID", ""), "Agent ID (assigned at registration)")
 	// Deprecated as a command-line flag: argv is visible to every user in `ps`.
 	// Still accepted (old hand-made units) with a warning; set
 	// OPSERVO_SECRET_KEY in the environment / config file instead.
-	secretKey      = flag.String("secret-key", getEnv("OPSERVO_SECRET_KEY", ""), "Agent secret key (deprecated on the command line — visible in ps; use OPSERVO_SECRET_KEY)")
+	secretKey      = flag.String("secret-key", getEnv("OPSERVO_SECRET_KEY", "INFRAPILOT_SECRET_KEY", ""), "Agent secret key (deprecated on the command line — visible in ps; use OPSERVO_SECRET_KEY)")
 	devMode        = flag.Bool("dev", false, "Development mode (verbose logging; skips TLS verify only for a loopback API URL)")
 	interval       = flag.Duration("interval", 60*time.Second, "Heartbeat interval")
-	autoUpdate     = flag.Bool("auto-update", getEnv("OPSERVO_AUTO_UPDATE", "true") != "false", "Self-update the agent binary from the API")
+	autoUpdate     = flag.Bool("auto-update", getEnv("OPSERVO_AUTO_UPDATE", "INFRAPILOT_AUTO_UPDATE", "true") != "false", "Self-update the agent binary from the API")
 	updateInterval = flag.Duration("update-interval", time.Hour, "How often to check for agent updates")
-	bufferPath     = flag.String("buffer-path", getEnv("OPSERVO_BUFFER_PATH", defaultBufferPath()), "Path to the local SQLite buffer")
+	bufferPath     = flag.String("buffer-path", getEnv("OPSERVO_BUFFER_PATH", "INFRAPILOT_BUFFER_PATH", defaultBufferPath()), "Path to the local SQLite buffer")
 	// SECURITY: remote command execution is CLOUD-CONTROLLED. The agent polls by
 	// default (so a fleet update makes every server ready with no per-box work),
 	// but a server only ever RUNS a command when its `actions_enabled` flag is
 	// turned on in the dashboard — the API refuses to dispatch otherwise. Set
 	// OPSERVO_ENABLE_ACTIONS=false as a hard, local kill-switch on a box that
 	// must never accept commands regardless of the dashboard.
-	enableActions  = flag.Bool("enable-actions", getEnv("OPSERVO_ENABLE_ACTIONS", "true") != "false", "Poll for dashboard-dispatched commands (execution still gated server-side; set false to hard-disable on this host)")
+	enableActions  = flag.Bool("enable-actions", getEnv("OPSERVO_ENABLE_ACTIONS", "INFRAPILOT_ENABLE_ACTIONS", "true") != "false", "Poll for dashboard-dispatched commands (execution still gated server-side; set false to hard-disable on this host)")
 	actionInterval = flag.Duration("action-interval", 5*time.Second, "How often to poll for dispatched commands")
 	// SECURITY: agent-based uptime probes (TCP checks against private-network
 	// targets, run from this box) are OFF unless the operator opts this server
 	// in locally. A fleet-wide agent update never makes a server probe anything.
 	// Assignments must also carry a valid API signature (see prober package).
-	enableProbes = flag.Bool("enable-probes", getEnv("OPSERVO_ENABLE_PROBES", "false") == "true", "Run dashboard-assigned private-network TCP uptime checks from this server (opt-in)")
+	enableProbes = flag.Bool("enable-probes", getEnv("OPSERVO_ENABLE_PROBES", "INFRAPILOT_ENABLE_PROBES", "false") == "true", "Run dashboard-assigned private-network TCP uptime checks from this server (opt-in)")
 	// SECURITY: live terminal sessions (B-6) are OFF unless the operator sets
 	// OPSERVO_ENABLE_SHELL=true on this server — unlike remote actions, the
 	// local switch defaults OFF, so a fleet update never gives any server an
 	// interactive shell. The dashboard's per-server switch must ALSO be on,
 	// remote actions must not be hard-disabled here, and every session start
 	// must carry a valid API signature (see the shell package).
-	enableShell = flag.Bool("enable-shell", getEnv("OPSERVO_ENABLE_SHELL", "false") == "true", "Allow live terminal sessions opened from the dashboard (opt-in; needs remote actions too)")
+	enableShell = flag.Bool("enable-shell", getEnv("OPSERVO_ENABLE_SHELL", "INFRAPILOT_ENABLE_SHELL", "false") == "true", "Allow live terminal sessions opened from the dashboard (opt-in; needs remote actions too)")
 )
 
 // defaultBufferPath returns a per-user location for the agent's SQLite buffer.
@@ -84,6 +85,13 @@ func main() {
 		"interval", *interval,
 		"dev_mode", *devMode,
 	)
+	// A box installed before the rename moves to the current layout on the
+	// first start of this build; the new service then replaces this process.
+	if migrate.Run() {
+		slog.Info("handed over to " + paths.ServiceName + " — waiting to be stopped")
+		time.Sleep(2 * time.Minute)
+		slog.Warn("still running after the hand-over — continuing on the old layout")
+	}
 
 	if flagSetOnCommandLine(flag.CommandLine, "secret-key") {
 		slog.Warn("--secret-key on the command line is visible to every user via ps; set OPSERVO_SECRET_KEY in " +
@@ -99,9 +107,9 @@ func main() {
 	// AMI-clone detection (see clonedetect.go). The installer records this
 	// box's identity; if the live identity differs, we're a clone booted from
 	// an image of another server and must NOT reuse its credentials.
-	enrollKey := getEnv("OPSERVO_ENROLL_KEY", "")
-	recordedIdentity := getEnv("OPSERVO_MACHINE_ID", "")
-	configPath := getEnv("OPSERVO_CONFIG_PATH", paths.ConfigFile("config"))
+	enrollKey := getEnv("OPSERVO_ENROLL_KEY", "INFRAPILOT_ENROLL_KEY", "")
+	recordedIdentity := getEnv("OPSERVO_MACHINE_ID", "INFRAPILOT_MACHINE_ID", "")
+	configPath := getEnv("OPSERVO_CONFIG_PATH", "INFRAPILOT_CONFIG_PATH", paths.ConfigFile("config"))
 	currentIdentity := collectors.InstanceIdentity()
 	if *agentID != "" && isClone(recordedIdentity, currentIdentity) {
 		if enrollKey != "" {
@@ -341,9 +349,13 @@ func isRateLimited(err error) bool {
 	return errors.As(err, &se) && se.Code == http.StatusTooManyRequests
 }
 
-// getEnv reads key, then the fallback default.
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
+// getEnv reads newKey first, then oldKey (backward compat for agents installed
+// with the legacy INFRAPILOT_* variables), then the fallback default.
+func getEnv(newKey, oldKey, fallback string) string {
+	if v := os.Getenv(newKey); v != "" {
+		return v
+	}
+	if v := os.Getenv(oldKey); v != "" {
 		return v
 	}
 	return fallback
