@@ -2,7 +2,7 @@
 bin/
 dist/
 /opservo-agent
-/infrapilot-agent
+/opservo-agent
 /k8s-agent
 
 # Go
