@@ -186,6 +186,7 @@ func main() {
 		collectors.NewConfigurationCollector(),
 		collectors.NewRuntimeCollector(),
 		collectors.NewUpdatesCollector(),
+		collectors.NewSoftwareCollector(),
 		collectors.NewScheduledCollector(),
 		collectors.NewUsersCollector(),
 		collectors.NewPackagesCollector(),
