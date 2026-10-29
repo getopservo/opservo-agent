@@ -85,6 +85,13 @@ var envDefaults = [][2]string{
 	{"PSQL_PAGER", "cat"},
 	{"GIT_PAGER", "cat"},
 	{"DEBIAN_FRONTEND", "noninteractive"},
+	// Package installs never stop on a question (founder decision, 29 Oct
+	// 2026): needrestart restarts services itself, ucf keeps the current
+	// file, apt-listchanges stays quiet. dpkg's own conffile question is
+	// answered through APT_CONFIG (aptconfig.go).
+	{"NEEDRESTART_MODE", "a"},
+	{"UCF_FORCE_CONFFOLD", "1"},
+	{"APT_LISTCHANGES_FRONTEND", "none"},
 	{"LANG", "C.UTF-8"},
 }
 
@@ -202,7 +209,7 @@ func runCommandWithProgress(ctx context.Context, command string, env map[string]
 	// a deploy's GitHub/Infisical credentials) as environment variables ONLY
 	// for this process — secrets are never written to the command text, the
 	// result, or disk.
-	cmd.Env = commandEnv(os.Environ(), homeDir(), env)
+	cmd.Env = withAptKeepConfig(commandEnv(os.Environ(), homeDir(), env), stateDir)
 	// Run the command in its own process group and kill the WHOLE group on
 	// timeout — otherwise a child that outlives `sh` (e.g. `sleep`) keeps the
 	// stdout pipe open and cmd.Wait() blocks until it exits. WaitDelay is a
