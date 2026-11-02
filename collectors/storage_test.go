@@ -216,3 +216,23 @@ func TestParseSmartctlJSON(t *testing.T) {
 		}
 	})
 }
+
+func TestDedupeDisksByDevice(t *testing.T) {
+	in := []DiskInfo{
+		{MountPoint: "/tmp/snap-private-tmp/snap.rootfs_abc", Device: "/dev/sda1", Percent: 90},
+		{MountPoint: "/", Device: "/dev/sda1", Percent: 90},
+		{MountPoint: "/data", Device: "/dev/sdb1", Percent: 40},
+		{MountPoint: "/mnt/nfs1", Device: "nas:/export", Percent: 10},
+		{MountPoint: "/mnt/nfs2", Device: "nas:/export", Percent: 10},
+	}
+	got := dedupeDisksByDevice(in)
+	want := []string{"/", "/data", "/mnt/nfs1", "/mnt/nfs2"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d disks, want %d: %+v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i].MountPoint != w {
+			t.Errorf("disk %d = %q, want %q", i, got[i].MountPoint, w)
+		}
+	}
+}

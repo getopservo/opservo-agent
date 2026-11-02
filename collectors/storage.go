@@ -279,6 +279,31 @@ func isContainerRuntimeMount(mount string) bool {
 	return false
 }
 
+// dedupeDisksByDevice keeps one entry per block device: the shortest mount
+// point (so "/" wins over a bind-mount like /tmp/snap-private-tmp/snap.x).
+// Bind-mounts report the same usage as their source, so listing each one only
+// multiplies "disk full" alerts. Non-/dev devices (NFS shares, "none") are
+// kept as-is — their device string does not identify a filesystem.
+func dedupeDisksByDevice(disks []DiskInfo) []DiskInfo {
+	best := map[string]int{}
+	out := make([]DiskInfo, 0, len(disks))
+	for _, d := range disks {
+		if !strings.HasPrefix(d.Device, "/dev/") {
+			out = append(out, d)
+			continue
+		}
+		if i, ok := best[d.Device]; ok {
+			if len(d.MountPoint) < len(out[i].MountPoint) {
+				out[i] = d
+			}
+			continue
+		}
+		best[d.Device] = len(out)
+		out = append(out, d)
+	}
+	return out
+}
+
 // Filesystems that are read-only by design — excluded from the read-only alarm.
 var readOnlyByDesign = map[string]bool{
 	"squashfs": true, "iso9660": true, "overlay": true, "erofs": true,

@@ -268,12 +268,16 @@ func (s *SystemCollector) Collect(ctx context.Context) (interface{}, error) {
 	// e.g. /run/docker/runtime-runc/moby/<id>/... — which are ephemeral runc
 	// artifacts, and read-only-by-design filesystems like squashfs — every
 	// installed snap package version is its own 100%-full squashfs loop mount,
-	// not storage an operator can act on).
+	// not storage an operator can act on). Bind-mounts of an already-listed
+	// block device — e.g. snapd's per-snap /tmp/snap-private-tmp/snap.<name>
+	// views of / — are the same filesystem, so only the shortest mount point
+	// per device is reported (dedupeDisksByDevice).
 	partitions, err := disk.PartitionsWithContext(ctx, false)
 	if err == nil {
 		for _, p := range partitions {
 			if pseudoFS[p.Fstype] || readOnlyByDesign[p.Fstype] || isContainerRuntimeMount(p.Mountpoint) ||
 				strings.HasPrefix(p.Mountpoint, "/snap/") || strings.HasPrefix(p.Mountpoint, "/var/lib/snapd/") ||
+				strings.HasPrefix(p.Mountpoint, "/tmp/snap-private-tmp/") ||
 				strings.HasPrefix(p.Mountpoint, "/sys") || strings.HasPrefix(p.Mountpoint, "/proc") || strings.HasPrefix(p.Mountpoint, "/dev") {
 				continue
 			}
@@ -291,6 +295,7 @@ func (s *SystemCollector) Collect(ctx context.Context) (interface{}, error) {
 				Percent:    usage.UsedPercent,
 			})
 		}
+		info.Disks = dedupeDisksByDevice(info.Disks)
 	}
 
 	// Load average (1, 5, 15 min). Linux-only; absent on some platforms.
