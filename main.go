@@ -20,6 +20,7 @@ import (
 	"github.com/getopservo/opservo-agent/prober"
 	"github.com/getopservo/opservo-agent/sender"
 	"github.com/getopservo/opservo-agent/shell"
+	"github.com/getopservo/opservo-agent/trust"
 	"github.com/getopservo/opservo-agent/updater"
 )
 
@@ -171,6 +172,10 @@ func main() {
 		slog.Info("Local buffer ready", "path", *bufferPath)
 	}
 
+	// Office addresses (workspace setting, signed, delivered in heartbeat
+	// responses): only used to label SSH logins as trusted — see trust package.
+	officeAddrs := trust.NewStore()
+
 	// Build collector registry
 	registry := collectors.NewRegistry([]collectors.Collector{
 		collectors.NewSystemCollector(),
@@ -180,7 +185,7 @@ func main() {
 		collectors.NewAppDetectCollector(),
 		collectors.NewDomainCollector(),
 		collectors.NewLogsCollector(buf),
-		collectors.NewSecurityCollector(),
+		collectors.NewSecurityCollector().WithTrust(officeAddrs),
 		collectors.NewStorageCollector(),
 		collectors.NewReliabilityCollector(),
 		collectors.NewConfigurationCollector(),
@@ -244,12 +249,12 @@ func main() {
 	defer ticker.Stop()
 
 	// Send immediately on start
-	sendHeartbeat(ctx, registry, s, buf, prb)
+	sendHeartbeat(ctx, registry, s, buf, prb, officeAddrs, *agentID)
 
 	for {
 		select {
 		case <-ticker.C:
-			sendHeartbeat(ctx, registry, s, buf, prb)
+			sendHeartbeat(ctx, registry, s, buf, prb, officeAddrs, *agentID)
 		case <-ctx.Done():
 			slog.Info("Agent shutting down")
 			return
@@ -269,7 +274,7 @@ const maxPendingHeartbeats = 15
 // 2 requests/min, well under the API's cap.
 const maxBackfillPerTick = 1
 
-func sendHeartbeat(ctx context.Context, registry *collectors.Registry, s *sender.Sender, buf *buffer.Buffer, prb *prober.Prober) {
+func sendHeartbeat(ctx context.Context, registry *collectors.Registry, s *sender.Sender, buf *buffer.Buffer, prb *prober.Prober, officeAddrs *trust.Store, agentID string) {
 	payload, err := registry.CollectAll(ctx)
 	if err != nil {
 		slog.Error("Collection failed", "error", err)
@@ -302,19 +307,51 @@ func sendHeartbeat(ctx context.Context, registry *collectors.Registry, s *sender
 		return
 	}
 	slog.Debug("Heartbeat sent successfully")
-	// The response may hand back signed probe assignments for this round.
-	if prb != nil && len(resp) > 0 {
+	// The response may hand back signed probe assignments for this round,
+	// and the workspace's signed office-address list.
+	if len(resp) > 0 {
 		var ack struct {
-			Checks []prober.Check `json:"checks"`
+			Checks          []prober.Check  `json:"checks"`
+			TrustedNetworks *trust.Delivery `json:"trusted_networks"`
 		}
-		if json.Unmarshal(resp, &ack) == nil && len(ack.Checks) > 0 {
-			prb.Run(ack.Checks)
+		if json.Unmarshal(resp, &ack) == nil {
+			if prb != nil && len(ack.Checks) > 0 {
+				prb.Run(ack.Checks)
+			}
+			applyOfficeAddresses(officeAddrs, agentID, ack.TrustedNetworks)
 		}
 	}
 	if buf != nil {
 		flushPending(ctx, s, buf)
 	}
 }
+
+// applyOfficeAddresses installs the office-address list from a heartbeat
+// response. The API sends it whenever the workspace has one (or this agent
+// reported one in use); an absent field leaves the current list alone. A list
+// that fails its signature check is refused and the stored list cleared, so
+// nothing is trusted.
+func applyOfficeAddresses(store *trust.Store, agentID string, d *trust.Delivery) {
+	if store == nil || d == nil {
+		return
+	}
+	before := store.Current().Hash()
+	if err := store.Apply(executor.CommandSigningPublicKeyHex(), agentID, *d); err != nil {
+		// Log once per distinct refusal, not every minute.
+		if msg := err.Error(); msg != lastOfficeRefusal {
+			lastOfficeRefusal = msg
+			slog.Warn("office-address list refused; no address is trusted", "error", err)
+		}
+		return
+	}
+	lastOfficeRefusal = ""
+	if after := store.Current().Hash(); after != before {
+		slog.Info("office-address list updated", "entries", len(d.CIDRs))
+	}
+}
+
+// lastOfficeRefusal de-duplicates the refusal warning (heartbeat loop only).
+var lastOfficeRefusal string
 
 // flushPending replays heartbeats buffered during a prior outage, oldest-first,
 // stopping at the first failure so the remainder is retried next time.

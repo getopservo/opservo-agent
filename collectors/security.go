@@ -15,6 +15,8 @@ import (
 
 	"github.com/shirou/gopsutil/v3/net"
 	"github.com/shirou/gopsutil/v3/process"
+
+	"github.com/getopservo/opservo-agent/trust"
 )
 
 // securityCmdTimeout bounds every external command the security collector runs,
@@ -71,6 +73,10 @@ type RecentLogin struct {
 	User      string `json:"user"`
 	FromIP    string `json:"from_ip"`
 	Timestamp string `json:"timestamp"`
+	// Trusted is set only when the workspace has office addresses: true when
+	// the FULL source address (matched on the box, before masking) is inside
+	// one of them. nil = no office addresses set.
+	Trusted *bool `json:"trusted,omitempty"`
 }
 
 // SecurityReport is the full output of the security collector. The score is
@@ -97,15 +103,28 @@ type SecurityReport struct {
 	FirewallBlockedPorts []int     `json:"firewall_blocked_ports,omitempty"`
 	Score                int       `json:"score"`
 	CollectedAt          time.Time `json:"collected_at"`
+	// Office-address summary for the last hour (see officetrust.go); nil when
+	// the workspace has no office addresses or the journal is unreadable.
+	OfficeTrust *OfficeTrust `json:"office_trust,omitempty"`
 }
 
 // SecurityCollector inspects the host for common, actionable security risks.
 // Every probe is best-effort and individually recovered, so a missing tool or a
 // failing command degrades that one signal rather than crashing the agent.
-type SecurityCollector struct{}
+type SecurityCollector struct {
+	// trust holds the workspace's office addresses as last delivered in a
+	// heartbeat response (nil/empty = feature off).
+	trust *trust.Store
+}
 
 func NewSecurityCollector() *SecurityCollector { return &SecurityCollector{} }
 func (s *SecurityCollector) Name() string      { return "security" }
+
+// WithTrust wires the office-address store filled from heartbeat responses.
+func (s *SecurityCollector) WithTrust(store *trust.Store) *SecurityCollector {
+	s.trust = store
+	return s
+}
 
 func (s *SecurityCollector) Collect(ctx context.Context) (interface{}, error) {
 	report := &SecurityReport{
@@ -120,7 +139,9 @@ func (s *SecurityCollector) Collect(ctx context.Context) (interface{}, error) {
 	report.RootLoginPermitted = secSafeVal("root_login", false, func() bool { return rootLoginPermitted() })
 	report.FirewallEnabled = secSafeVal("firewall", false, func() bool { return firewallEnabled(ctx) })
 	report.SuspiciousProcesses = secSafe("suspicious_procs", func() []SuspiciousProcess { return suspiciousProcesses(ctx) })
-	report.RecentLogins = secSafe("recent_logins", func() []RecentLogin { return recentLogins(ctx) })
+	office := s.trust.Current()
+	report.RecentLogins = secSafe("recent_logins", func() []RecentLogin { return recentLogins(ctx, office) })
+	report.OfficeTrust = secSafeVal[*OfficeTrust]("office_trust", nil, func() *OfficeTrust { return officeTrust(ctx, office) })
 
 	// SSH hardening — parsed once from sshd_config (nil when unreadable → dormant).
 	if h := secSafeVal("ssh_hardening", sshHardening{}, sshHardeningFromConfig); h.readable {
@@ -750,7 +771,7 @@ func firstField(s string) string {
 
 // ── Recent successful logins ──────────────────────────────────────────────────
 
-func recentLogins(ctx context.Context) []RecentLogin {
+func recentLogins(ctx context.Context, office trust.List) []RecentLogin {
 	if !hasBinary("last") {
 		return nil
 	}
@@ -758,7 +779,7 @@ func recentLogins(ctx context.Context) []RecentLogin {
 	if err != nil {
 		return nil
 	}
-	return parseLastOutput(string(out))
+	return parseLastOutputTrusted(string(out), office)
 }
 
 // lastTimestampRe locates the date/time portion of a `last` line by pattern
@@ -784,6 +805,13 @@ var lastTimestampRe = regexp.MustCompile(`(?i)\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\
 // footers, or anything too sparse to trust) are skipped rather than guessed
 // at, consistent with this file's per-probe "degrade, don't crash" approach.
 func parseLastOutput(out string) []RecentLogin {
+	return parseLastOutputTrusted(out, trust.List{})
+}
+
+// parseLastOutputTrusted is parseLastOutput that also marks each login whose
+// FULL source address is an office address (Trusted stays nil when the list
+// is empty). The address is masked only after the match.
+func parseLastOutputTrusted(out string, office trust.List) []RecentLogin {
 	var logins []RecentLogin
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
@@ -791,29 +819,34 @@ func parseLastOutput(out string) []RecentLogin {
 		if line == "" {
 			continue
 		}
-		login, ok := parseLastLine(line)
+		login, from, ok := parseLastLine(line)
 		if !ok {
 			continue
+		}
+		if !office.Empty() {
+			t := office.Contains(from)
+			login.Trusted = &t
 		}
 		logins = append(logins, login)
 	}
 	return logins
 }
 
-// parseLastLine parses a single `last` line into a RecentLogin, or reports
+// parseLastLine parses a single `last` line into a RecentLogin (masked) plus
+// the full, unmasked source host for the office-address match, or reports
 // ok=false if the line isn't a login record (footer/header/garbage).
-func parseLastLine(line string) (RecentLogin, bool) {
+func parseLastLine(line string) (RecentLogin, string, bool) {
 	fields := strings.Fields(line)
 	if len(fields) < 2 {
-		return RecentLogin{}, false
+		return RecentLogin{}, "", false
 	}
 	user := fields[0]
 	switch user {
 	case "reboot", "shutdown", "wtmp", "btmp":
-		return RecentLogin{}, false
+		return RecentLogin{}, "", false
 	}
 	if strings.HasPrefix(line, "wtmp begins") || strings.HasPrefix(line, "btmp begins") {
-		return RecentLogin{}, false
+		return RecentLogin{}, "", false
 	}
 
 	// Only look for a host/IP among the fields BEFORE the timestamp — a time
@@ -838,10 +871,10 @@ func parseLastLine(line string) (RecentLogin, bool) {
 	// Not enough signal to trust this as a real login line (e.g. a stray
 	// header or truncated row from an unfamiliar `last` build).
 	if ts == "" && from == "" && len(prefixFields) < 2 {
-		return RecentLogin{}, false
+		return RecentLogin{}, "", false
 	}
 
-	return RecentLogin{User: maskUser(user), FromIP: maskIP(from), Timestamp: ts}, true
+	return RecentLogin{User: maskUser(user), FromIP: maskIP(from), Timestamp: ts}, from, true
 }
 
 // looksLikeHost is a loose check that a `last` column is a source host/IP rather
